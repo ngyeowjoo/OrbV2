@@ -310,8 +310,16 @@ def build_chart(intent: str, df):
     return None
 
 # ── API CALLERS ───────────────────────────────────────────────────────────────
+def _get_secret(key: str) -> str:
+    """Read from st.secrets (Streamlit Cloud) with fallback to os.environ (local dev)."""
+    try:
+        return st.secrets[key]
+    except Exception:
+        return os.environ.get(key, "")
+
+
 def _call_anthropic(messages: list, system: str, model_id: str) -> str:
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    api_key = _get_secret("ANTHROPIC_API_KEY")
     r = requests.post(
         ANTHROPIC_API_URL,
         headers={
@@ -332,7 +340,7 @@ def _call_anthropic(messages: list, system: str, model_id: str) -> str:
 
 
 def _call_deepseek(messages: list, system: str, model_id: str) -> str:
-    api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+    api_key = _get_secret("DEEPSEEK_API_KEY")
     # DeepSeek uses OpenAI-compatible format: system prompt goes as first message
     openai_messages = [{"role": "system", "content": system}] + messages
     r = requests.post(
