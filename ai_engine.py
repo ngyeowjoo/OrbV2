@@ -46,15 +46,15 @@ C_GOOD  = "#27AE60"
 PALETTE = [C_AMBER, "#FFD166", C_WARN, C_BAD, "#9B59B6", C_GOOD, "#3498DB"]
 
 PLOT_THEME = dict(
-    paper_bgcolor="#111111", plot_bgcolor="#111111",
-    font=dict(color="#CCCCCC", family="DM Mono, monospace", size=11),
+    paper_bgcolor="#FFFFFF", plot_bgcolor="#FAFAFA",
+    font=dict(color="#374151", family="Inter, sans-serif", size=11),
     margin=dict(l=32, r=16, t=40, b=32),
     legend=dict(bgcolor="rgba(0,0,0,0)"),
 )
 
 def _fmt_axes(fig):
-    fig.update_xaxes(gridcolor="#222", zeroline=False)
-    fig.update_yaxes(gridcolor="#222", zeroline=False)
+    fig.update_xaxes(gridcolor="#E5E7EB", zeroline=False, linecolor="#E5E7EB")
+    fig.update_yaxes(gridcolor="#E5E7EB", zeroline=False, linecolor="#E5E7EB")
 
 # ── INTENT CLASSIFIER ─────────────────────────────────────────────────────────
 INTENT_PATTERNS = {
@@ -374,36 +374,52 @@ def call_model(messages: list, system: str, model_name: str) -> str:
         raise ValueError(f"Unknown provider: {provider}")
 
 # ── MAIN ENTRY POINT ──────────────────────────────────────────────────────────
-def answer(question: str, history: list, user: dict, model_name: str = DEFAULT_MODEL):
+def answer(question: str, history: list, user: dict,
+           model_name: str = DEFAULT_MODEL, last_df=None):
     """
     Returns (text_answer, plotly_fig_or_None, dataframe_or_None)
-    history: list of {role, content} dicts (prior turns)
+    history:  list of {role, content} dicts (prior turns)
     model_name: key from MODELS dict
+    last_df:  dataframe from previous turn — used to give follow-up questions
+              context even when the new question does not trigger a fresh retrieval
     """
     countries = user["countries"]
     intent    = detect_intent(question)
     df, data_context = retrieve_data(intent, countries, question)
     chart = build_chart(intent, df)
 
+    # For free-form follow-ups that return no new data, inject the previous
+    # dataframe so the AI can still reason over the prior result set
+    if (intent == "free_form" or df is None) and last_df is not None:
+        try:
+            prev_context = f"\n\nPrevious query result (use for follow-up reasoning):\n{last_df.to_string(index=False)}"
+            data_context += prev_context
+            if df is None:
+                df = last_df   # surface it in the panel too
+        except Exception:
+            pass
+
     scope = "Global" if "ALL" in countries else ", ".join(countries)
     cfg   = MODELS.get(model_name, MODELS[DEFAULT_MODEL])
 
     system = f"""You are the Orb v2 AI assistant — an executive-grade workforce intelligence analyst.
-You are answering a {user['role']} named {user['display_name']}.
+You are answering a {user["role"]} named {user["display_name"]}.
 Their data scope: {scope}.
 Data sources available: Flash Reward (Incentive System) and Flash Home (HR System).
-Today's date: {pd.Timestamp.today().strftime('%d %b %Y')}.
-You are running on: {cfg['tag']} — {model_name}.
+Today's date: {pd.Timestamp.today().strftime("%d %b %Y")}.
+You are running on: {cfg["tag"]} — {model_name}.
 
 Rules:
 - Be concise, executive-grade. Lead with the insight, not methodology.
 - If data shows something concerning, flag it clearly.
 - Reference specific numbers from the data provided.
-- If a chart has been generated, mention it naturally ("as shown in the chart").
+- If a chart has been generated, mention it naturally (as shown in the chart).
+- Do NOT use markdown bold (**text**) or italic (*text*) formatting in your response.
 - Do NOT mention SQL, dataframes, or technical implementation details.
 - Keep answers to 3-5 sentences for simple queries; use brief bullet points for lists.
 - Always state the data scope and cycle period you are referencing.
 - If the data is insufficient to answer, say so clearly and suggest what data would help.
+- For follow-up questions, use the previous query result provided in the data context.
 
 Data context:
 {data_context}
