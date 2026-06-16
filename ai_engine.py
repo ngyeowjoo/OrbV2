@@ -1,6 +1,8 @@
 """
 ai_engine.py  —  Intent detection, data retrieval, streaming multi-model reasoning
 Supports: Claude (Anthropic) and DeepSeek (OpenAI-compatible)
+Uses AI router (router.py) for intelligent intent classification.
+Falls back to regex if router unavailable.
 """
 import os, re
 import pandas as pd
@@ -469,63 +471,114 @@ def call_model(messages, system, model_name):
         return _call_anthropic(messages, system, cfg["model_id"])
     return _call_deepseek(messages, system, cfg["model_id"])
 
+def _get_followup_context(countries: list, last_df) -> tuple:
+    """
+    For follow-up questions, build a rich joined context from Flash Reward + Flash Home.
+    Always returns a fully joined df so the AI can answer identity questions.
+    """
+    from data import get_flash_reward, get_flash_home
+    fr  = get_flash_reward(countries)
+    fh  = get_flash_home(countries)
+    latest = fr["Cycle"].max()
+    cyc = fr[fr["Cycle"] == latest].drop_duplicates("EmployeeID")
+    name_cols = [c for c in ["EmployeeID","EmployeeName","Country","Project",
+                              "EmployeeStatus","PMGMRating"] if c in fh.columns]
+    joined = cyc.merge(fh[name_cols], on="EmployeeID", how="left")
+    show = [c for c in ["EmployeeID","EmployeeName","Scheme","TotalCyclePayout",
+                         "SchemeMaxPayout","QualifierFailed","ProrFactor",
+                         "Country","Project","PMGMRating","EmployeeStatus"] if c in joined.columns]
+    joined = joined[show]
+
+    parts = [f"Latest cycle: {latest}. Full employee payout + HR joined data:"]
+    parts.append(joined.to_string(index=False))
+
+    if last_df is not None:
+        try:
+            parts.append(f"\nPrevious query result for reference:\n{last_df.head(50).to_string(index=False)}")
+        except Exception:
+            pass
+
+    return joined, "\n".join(parts)
+
 
 # ── MAIN ENTRY POINT ──────────────────────────────────────────────────────────
 def answer(question: str, history: list, user: dict,
            model_name: str = DEFAULT_MODEL, last_df=None):
     """
-    Returns (stream_generator, plotly_fig_or_None, dataframe_or_None, system_prompt)
-    Caller should consume the generator with st.write_stream() and capture the text.
+    Returns (stream_generator, plotly_fig_or_None, dataframe_or_None)
+    Uses AI router to classify intent then fetches the right data.
     """
-    countries = user["countries"]
-    intent    = detect_intent(question)
-    df, data_context = retrieve_data(intent, countries, question)
-    chart = build_chart(intent, df)
+    from router import route
 
-    # Inject previous df for follow-up context
-    if (intent == "free_form" or df is None) and last_df is not None:
+    countries = user["countries"]
+
+    # ── Step 1: AI Router ────────────────────────────────────────────────────
+    last_df_cols = list(last_df.columns) if last_df is not None else []
+    routing      = route(question, history, last_df_cols)
+
+    intent          = routing.get("intent", "free_form")
+    needs_fresh     = routing.get("needs_fresh_join", False)
+    is_followup     = routing.get("is_followup", False)
+    filters         = routing.get("filters", {})
+    router_reason   = routing.get("reasoning", "")
+
+    # ── Step 2: Apply router filters to country scope ────────────────────────
+    # Router can narrow country further (e.g. "show SG only" within a global user)
+    scoped_countries = countries
+    if filters.get("country") and "ALL" not in countries:
+        rc = filters["country"].upper()
+        if rc in countries:
+            scoped_countries = [rc]
+    elif filters.get("country") and "ALL" in countries:
+        scoped_countries = [filters["country"].upper()]
+
+    # ── Step 3: Retrieve data ─────────────────────────────────────────────────
+    # If router says fresh join needed OR it's a follow-up — always get full joined data
+    if needs_fresh or is_followup:
         try:
-            data_context += f"\n\nPrevious query result (use for follow-up reasoning):\n{last_df.to_string(index=False)}"
-            # If last_df has EmployeeID but no payout/name data, proactively enrich
-            if "EmployeeID" in last_df.columns and "EmployeeName" not in last_df.columns:
-                from data import get_flash_home
-                fh = get_flash_home(countries)
-                name_cols = [c for c in ["EmployeeID","EmployeeName"] if c in fh.columns]
-                if len(name_cols) > 1:
-                    enriched = last_df.merge(fh[name_cols], on="EmployeeID", how="left")
-                    data_context += f"\n\nSame data with employee names added:\n{enriched.to_string(index=False)}"
-                    if df is None:
-                        df = enriched
-            elif df is None:
-                df = last_df
+            df, data_context = _get_followup_context(scoped_countries, last_df)
+            chart = None   # no chart for cross-source follow-ups
         except Exception:
-            pass
+            df, data_context = retrieve_data(intent, scoped_countries, question)
+            chart = build_chart(intent, df)
+    else:
+        df, data_context = retrieve_data(intent, scoped_countries, question)
+        chart = build_chart(intent, df)
+
+    # Apply scheme / status filter from router if dataframe supports it
+    if df is not None and not df.empty:
+        if filters.get("scheme") and "Scheme" in df.columns:
+            df = df[df["Scheme"].str.lower() == filters["scheme"].lower()]
+            data_context += f"\n[Filtered to scheme: {filters['scheme']}]"
+        if filters.get("status") and "EmployeeStatus" in df.columns:
+            df = df[df["EmployeeStatus"] == filters["status"]]
+            data_context += f"\n[Filtered to status: {filters['status']}]"
 
     scope = "Global" if "ALL" in countries else ", ".join(countries)
     cfg   = MODELS.get(model_name, MODELS[DEFAULT_MODEL])
 
-    # Chart generated — ensure text always accompanies it
     chart_note = ""
     if chart is not None:
-        chart_note = "\n- A chart has been generated and will be shown alongside your response. Always provide a written summary — never return only a chart."
+        chart_note = "\n- A chart has been generated alongside your response. Always provide a written summary."
 
     system = f"""You are the Orb v2 AI assistant — an executive-grade workforce intelligence analyst.
 You are answering a {user["role"]} named {user["display_name"]}.
 Their data scope: {scope}.
 Data sources: Flash Reward (Incentive System) and Flash Home (HR System).
 Today: {pd.Timestamp.today().strftime("%d %b %Y")}. Model: {model_name}.
+Query intent: {intent}. Follow-up: {is_followup}. Router: {router_reason}
 
 Rules:
 - Be concise and executive-grade. Lead with the insight.
-- Flag concerning data clearly.
-- Reference specific numbers from the data.
-- When the data includes EmployeeName, refer to employees by name (not EmployeeID) in your narrative. You may mention EmployeeID alongside the name for cross-referencing if helpful (e.g. "Aisyah Torres (E0001)").
+- Flag concerning data clearly with specific numbers.
+- When EmployeeName is in the data, refer to employees by name not ID.
+  You may add ID in brackets for reference e.g. "Aisyah Torres (E0001)".
 - Do NOT use markdown bold (**) or italic (*) formatting.
-- Do NOT mention SQL, dataframes, or technical details.
-- Always write a response — never return an empty string.
-- Keep answers to 3-5 sentences for simple queries; use plain bullet points (- item) for lists.
-- State the scope and cycle period you are referencing.
-- For follow-up questions, use the previous query result in the data context.{chart_note}
+- Do NOT mention SQL, dataframes, router, or technical implementation details.
+- Always write a substantive response — never return an empty string.
+- 3-5 sentences for simple queries; plain bullet points (- item) for lists.
+- Always state the data scope and cycle period you are referencing.
+- For follow-up questions: the full joined dataset is in context — use it.{chart_note}
 
 Data context:
 {data_context}
