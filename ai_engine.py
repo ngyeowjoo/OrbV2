@@ -64,6 +64,7 @@ INTENT_PATTERNS = {
     "anomaly":          r"(anomaly|mismatch|high.*rating.*low|low.*rating.*high|pmgm.*payout|payout.*pmgm)",
     "cross_check":      r"(non.?active|inactive|left.*payout|payout.*left|leaver|exit)",
     "new_joiner":       r"(new joiner|first cycle|recently joined|new hire)",
+    "employee_list":    r"(show.*name|list.*name|employee.*name|name.*employee|who are|all employee|employee list|staff list|roster|directory)",
     "headcount":        r"(headcount|how many|count|active.*employee|employee.*active|workforce size)",
     "attrition":        r"(attrition|left|resign|turnover|leavers)",
     "pmgm":             r"(pmgm|performance rating|rating distribution|appraisal)",
@@ -165,6 +166,16 @@ def retrieve_data(intent: str, countries: list, question: str):
         df     = new.merge(fr_l[["EmployeeID","Scheme","TotalCyclePayout","ProrFactor"]], on="EmployeeID", how="left")
         show_cols = [c for c in ["EmployeeID","EmployeeName","JoinDate","Country","Scheme","TotalCyclePayout","ProrFactor"] if c in df.columns]
         return df, f"New joiners (last 6 months) on incentive, scope: {scope}.\n{df[show_cols].to_string(index=False)}"
+
+    elif intent == "employee_list":
+        fh = get_flash_home(countries)
+        cols = [c for c in ["EmployeeID","EmployeeName","Country","Project",
+                             "EmployeeStatus","PMGMRating"] if c in fh.columns]
+        df = fh[cols].copy()
+        has_names = "EmployeeName" in df.columns
+        return df, (f"Employee directory, scope: {scope}. Total: {len(df)} employees.\n"
+                    f"{'EmployeeName is included in the data.' if has_names else 'Note: EmployeeName not available.'}\n"
+                    f"{df.to_string(index=False)}")
 
     elif intent == "headcount":
         fh   = get_flash_home(countries)
