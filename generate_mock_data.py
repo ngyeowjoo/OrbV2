@@ -21,6 +21,26 @@ QUALIFIERS  = ["Attendance Qualifier", "Compliance Qualifier", "Ethics Qualifier
 RATINGS     = ["Exceptional", "Exceeds Expectations", "Meets Expectations", "Below Expectations", "Unsatisfactory"]
 CYCLES      = ["2024-Q1", "2024-Q2", "2024-Q3", "2024-Q4", "2025-Q1", "2025-Q2"]
 
+# Name pools — mix of names common across SG/MY/PH/TH/ID workforces
+FIRST_NAMES = [
+    "Wei Ling", "Jun Hao", "Mei Xin", "Kai Ming", "Hui Min", "Zhi Yang", "Si Hui", "Jia Hao",
+    "Aisyah", "Aiman", "Nur Aina", "Hafiz", "Farah", "Amirul", "Nadia", "Syafiq",
+    "Maria", "Jose", "Carlo", "Angelica", "Mark", "Princess", "Joshua", "Bea",
+    "Somchai", "Siriporn", "Anong", "Niran", "Chanya", "Krit", "Suda", "Pakorn",
+    "Budi", "Siti", "Agus", "Dewi", "Eko", "Rina", "Hendra", "Putri",
+]
+LAST_NAMES = [
+    "Tan", "Lim", "Lee", "Wong", "Ng", "Chen", "Goh", "Teo",
+    "Abdullah", "Rahman", "Ismail", "Hassan", "Yusof", "Bakar",
+    "Santos", "Reyes", "Cruz", "Garcia", "Torres", "Ramos",
+    "Srisai", "Charoen", "Saetang", "Wong", "Phongsri",
+    "Wijaya", "Santoso", "Hartono", "Saputra", "Kusuma",
+]
+
+def _gen_employee_name(seed: int) -> str:
+    rnd = random.Random(seed)  # deterministic per-employee name
+    return f"{rnd.choice(FIRST_NAMES)} {rnd.choice(LAST_NAMES)}"
+
 N_EMP = 120
 
 # ── FLASH HOME ──────────────────────────────────────────────────────────────
@@ -36,6 +56,7 @@ def gen_flash_home():
         rating     = random.choices(RATINGS, weights=[10, 25, 40, 18, 7])[0]
         rows.append({
             "EmployeeID":       emp_id,
+            "EmployeeName":     _gen_employee_name(i),
             "EmployeeStatus":   "Active" if is_active else "Non-Active",
             "JoinDate":         join_date,
             "LastDate":         last_date,
