@@ -1,13 +1,14 @@
 """
 app.py  —  Orb v2  |  Workforce Intelligence Platform
-Claude-style sidebar nav, streaming responses, blank answer fix.
+Fixes: chat persistence (panels), thinking placeholder, Enter-to-send,
+       compact centered suggestion cards, natural sidebar collapse.
 """
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
 import re
 from auth import authenticate, scope_label
-from ai_engine import answer, MODELS, MODEL_NAMES, DEFAULT_MODEL
+from ai_engine import answer, MODELS, MODEL_NAMES, DEFAULT_MODEL, call_model
 from chat_store import save_chat, load_all, load_chat, delete_chat, fmt_ts
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -28,7 +29,7 @@ BORDER  = "#E5E7EB"
 TEXT    = "#111827"
 SUBTEXT = "#6B7280"
 USERBG  = "#F3F4F6"
-SB_BG   = "#111827"   # dark sidebar like Claude
+SB_BG   = "#111827"
 SB_TEXT = "#F9FAFB"
 SB_SUB  = "#9CA3AF"
 SB_HVR  = "#1F2937"
@@ -44,26 +45,24 @@ st.markdown(f"""
 *, *::before, *::after {{ box-sizing: border-box; margin: 0; }}
 html, body, .stApp {{ background: {BG} !important; color: {TEXT}; }}
 #MainMenu, footer {{ display: none !important; }}
-.block-container {{ padding: 0 !important; max-width: 100% !important; }}
+.block-container {{ padding: 0 1rem !important; max-width: 100% !important; }}
 
-/* ── Sidebar dark ── */
+/* ── Sidebar — let Streamlit handle collapse/expand natively ── */
 section[data-testid="stSidebar"] {{
     background: {SB_BG} !important;
     border-right: 1px solid #1F2937 !important;
-    min-width: 260px !important; max-width: 260px !important;
 }}
+section[data-testid="stSidebar"] > div {{ background: {SB_BG} !important; }}
 section[data-testid="stSidebar"] * {{ color: {SB_TEXT} !important; }}
 section[data-testid="stSidebar"] .stButton > button {{
     background: transparent !important; border: none !important;
     color: {SB_TEXT} !important; font-family: 'Inter', sans-serif !important;
     font-size: 0.82rem !important; font-weight: 400 !important;
     padding: 8px 12px !important; border-radius: 8px !important;
-    text-align: left !important; width: 100% !important;
-    box-shadow: none !important;
+    text-align: left !important; width: 100% !important; box-shadow: none !important;
 }}
 section[data-testid="stSidebar"] .stButton > button:hover {{
-    background: {SB_HVR} !important; color: {SB_TEXT} !important;
-    border: none !important;
+    background: {SB_HVR} !important; color: {SB_TEXT} !important; border: none !important;
 }}
 section[data-testid="stSidebar"] .new-chat-btn > button {{
     background: rgba(217,119,6,0.18) !important;
@@ -76,8 +75,7 @@ section[data-testid="stSidebar"] .new-chat-btn > button:hover {{
 }}
 section[data-testid="stSidebar"] .signout-btn > button {{
     background: transparent !important; border: 1px solid #374151 !important;
-    color: {SB_SUB} !important; border-radius: 8px !important;
-    font-size: 0.80rem !important;
+    color: {SB_SUB} !important; border-radius: 8px !important; font-size: 0.80rem !important;
 }}
 section[data-testid="stSidebar"] .signout-btn > button:hover {{
     border-color: #EF4444 !important; color: #FCA5A5 !important;
@@ -109,24 +107,26 @@ section[data-testid="stSidebar"] .del-btn > button:hover {{
 .stTextInput > div > div > input::placeholder {{ color: #9CA3AF !important; }}
 .stTextInput label {{ display: none !important; }}
 
-.stButton > button {{
+.stButton > button, [data-testid="stFormSubmitButton"] > button {{
     background: {CARD} !important; border: 1px solid {BORDER} !important;
     border-radius: 8px !important; color: {SUBTEXT} !important;
     font-family: 'Inter', sans-serif !important; font-size: 0.82rem !important;
     font-weight: 500 !important; padding: 7px 14px !important;
     box-shadow: 0 1px 2px rgba(0,0,0,0.04) !important; transition: all 0.15s !important;
 }}
-.stButton > button:hover {{
+.stButton > button:hover, [data-testid="stFormSubmitButton"] > button:hover {{
     border-color: {AMBER} !important; color: {AMBER} !important; background: {AMBERL} !important;
 }}
-.send-btn > button {{
+.send-btn > div > button, .send-btn [data-testid="stFormSubmitButton"] > button {{
     background: {AMBER} !important; border: none !important;
     border-radius: 8px !important; color: #fff !important;
     font-family: 'Inter', sans-serif !important; font-size: 0.85rem !important;
     font-weight: 600 !important; padding: 9px 22px !important;
     box-shadow: 0 2px 8px rgba(217,119,6,0.28) !important;
 }}
-.send-btn > button:hover {{ background: #B45309 !important; }}
+.send-btn > div > button:hover, .send-btn [data-testid="stFormSubmitButton"] > button:hover {{
+    background: #B45309 !important; color: #fff !important;
+}}
 
 div[data-testid="stSelectbox"] > div > div {{
     background: {CARD} !important; border: 1px solid {BORDER} !important;
@@ -144,18 +144,32 @@ div[data-testid="stSelectbox"] label {{
 [data-testid="stMetricValue"] {{ color: {AMBER} !important; font-size: 1.4rem !important; font-weight:700 !important; }}
 [data-testid="stDataFrame"] {{ border: 1px solid {BORDER} !important; border-radius: 8px; }}
 .stSpinner > div {{ border-top-color: {AMBER} !important; }}
+div[data-testid="stForm"] {{ border: none !important; padding: 0 !important; }}
 
+/* Compact centered suggestion cards */
 .sug-card > button {{
     background: {CARD} !important; border: 1px solid {BORDER} !important;
-    border-radius: 12px !important; color: {TEXT} !important;
-    font-family: 'Inter', sans-serif !important; font-size: 0.80rem !important;
-    font-weight: 500 !important; padding: 12px 14px !important;
-    text-align: left !important; min-height: 52px !important;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.05) !important;
+    border-radius: 10px !important; color: {TEXT} !important;
+    font-family: 'Inter', sans-serif !important; font-size: 0.76rem !important;
+    font-weight: 400 !important; padding: 10px 12px !important;
+    text-align: center !important; min-height: 46px !important;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.05) !important; line-height: 1.35 !important;
 }}
 .sug-card > button:hover {{
     border-color: {AMBER} !important; background: {AMBERL} !important; color: {AMBER} !important;
 }}
+
+/* Thinking indicator */
+@keyframes orbPulse {{
+    0%, 100% {{ opacity: 0.3; transform: scale(0.85); }}
+    50%      {{ opacity: 1;   transform: scale(1.05); }}
+}}
+.thinking-dot {{
+    display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+    background: {AMBER}; margin: 0 2px; animation: orbPulse 1.2s ease-in-out infinite;
+}}
+.thinking-dot:nth-child(2) {{ animation-delay: 0.2s; }}
+.thinking-dot:nth-child(3) {{ animation-delay: 0.4s; }}
 </style>
 """, unsafe_allow_html=True)
 
@@ -184,11 +198,26 @@ def clean_md(text: str) -> str:
     text = re.sub(r'_(.+?)_',       r'\1', text)
     return text.strip()
 
+ASSISTANT_AVATAR = (
+    "background:radial-gradient(circle at 38% 35%,#fff8e0 0%,#F9A602 30%,#c97f00 60%,#3d1f00 100%);"
+    "box-shadow:0 0 6px rgba(217,119,6,0.28);"
+)
+
+def render_user_bubble(content):
+    st.markdown(f"""
+    <div style="display:flex;justify-content:flex-end;margin:14px 0 4px;">
+        <div style="background:{USERBG};border:1px solid {BORDER};
+                    border-radius:16px 16px 4px 16px;padding:10px 15px;
+                    max-width:72%;font-family:'Inter',sans-serif;
+                    font-size:0.88rem;color:{TEXT};line-height:1.55;">
+            {content}</div>
+    </div>""", unsafe_allow_html=True)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ── LOGIN PAGE ────────────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 if not st.session_state["authenticated"]:
-    # Hide sidebar on login
     st.markdown("<style>section[data-testid='stSidebar']{display:none!important;}</style>",
                 unsafe_allow_html=True)
 
@@ -196,28 +225,28 @@ if not st.session_state["authenticated"]:
     <!DOCTYPE html><html><head>
     <link href="https://fonts.googleapis.com/css2?family=Syne:wght@800&family=DM+Mono:wght@400&display=swap" rel="stylesheet">
     <style>
-    *{{margin:0;padding:0;box-sizing:border-box;}}
-    body{{background:transparent;display:flex;flex-direction:column;
-          align-items:center;justify-content:center;height:220px;overflow:hidden;}}
-    .ring{{position:absolute;border-radius:50%;top:50%;left:50%;
-           border:1px solid rgba(217,119,6,0.12);animation:pulse 4s ease-in-out infinite;}}
-    .ring:nth-child(1){{width:130px;height:130px;}}
-    .ring:nth-child(2){{width:210px;height:210px;animation-delay:.7s;border-color:rgba(217,119,6,0.07);}}
-    .ring:nth-child(3){{width:310px;height:310px;animation-delay:1.4s;border-color:rgba(217,119,6,0.04);}}
-    @keyframes pulse{{0%,100%{{transform:translate(-50%,-50%) scale(1);opacity:1;}}
-                      50%{{transform:translate(-50%,-50%) scale(1.05);opacity:0.4;}}}}
-    .orb{{width:64px;height:64px;border-radius:50%;position:relative;z-index:2;
-          background:radial-gradient(circle at 38% 35%,#fff8e0 0%,#F9A602 25%,#c97f00 52%,#7a4500 78%,#3d1f00 100%);
-          box-shadow:0 0 24px 8px rgba(217,119,6,0.3);animation:float 5s ease-in-out infinite;}}
-    .orb::before{{content:'';position:absolute;top:17%;left:21%;width:36%;height:24%;
-                  background:radial-gradient(ellipse,rgba(255,255,255,0.6) 0%,transparent 70%);
-                  border-radius:50%;transform:rotate(-30deg);}}
-    @keyframes float{{0%,100%{{transform:translateY(0);}}50%{{transform:translateY(-7px);}}}}
-    .title{{font-family:'Syne',sans-serif;font-size:1.7rem;font-weight:800;
-            color:#111827;margin-top:12px;text-align:center;}}
-    .title span{{color:#D97706;}}
-    .sub{{font-family:'DM Mono',monospace;font-size:0.56rem;letter-spacing:0.22em;
-          text-transform:uppercase;color:#9CA3AF;margin-top:4px;text-align:center;}}
+    *{margin:0;padding:0;box-sizing:border-box;}
+    body{background:transparent;display:flex;flex-direction:column;
+         align-items:center;justify-content:center;height:220px;overflow:hidden;}
+    .ring{position:absolute;border-radius:50%;top:50%;left:50%;
+          border:1px solid rgba(217,119,6,0.12);animation:pulse 4s ease-in-out infinite;}
+    .ring:nth-child(1){width:130px;height:130px;}
+    .ring:nth-child(2){width:210px;height:210px;animation-delay:.7s;border-color:rgba(217,119,6,0.07);}
+    .ring:nth-child(3){width:310px;height:310px;animation-delay:1.4s;border-color:rgba(217,119,6,0.04);}
+    @keyframes pulse{0%,100%{transform:translate(-50%,-50%) scale(1);opacity:1;}
+                     50%{transform:translate(-50%,-50%) scale(1.05);opacity:0.4;}}
+    .orb{width:64px;height:64px;border-radius:50%;position:relative;z-index:2;
+         background:radial-gradient(circle at 38% 35%,#fff8e0 0%,#F9A602 25%,#c97f00 52%,#7a4500 78%,#3d1f00 100%);
+         box-shadow:0 0 24px 8px rgba(217,119,6,0.3);animation:float 5s ease-in-out infinite;}
+    .orb::before{content:'';position:absolute;top:17%;left:21%;width:36%;height:24%;
+                 background:radial-gradient(ellipse,rgba(255,255,255,0.6) 0%,transparent 70%);
+                 border-radius:50%;transform:rotate(-30deg);}
+    @keyframes float{0%,100%{transform:translateY(0);}50%{transform:translateY(-7px);}}
+    .title{font-family:'Syne',sans-serif;font-size:1.7rem;font-weight:800;
+           color:#111827;margin-top:12px;text-align:center;}
+    .title span{color:#D97706;}
+    .sub{font-family:'DM Mono',monospace;font-size:0.56rem;letter-spacing:0.22em;
+        text-transform:uppercase;color:#9CA3AF;margin-top:4px;text-align:center;}
     </style></head><body>
     <div class="ring"></div><div class="ring"></div><div class="ring"></div>
     <div class="orb"></div>
@@ -275,7 +304,7 @@ if not st.session_state["authenticated"]:
         ceo / coo.apac / head.sg / hr.admin &nbsp;·&nbsp; password: demo</p>
         """, unsafe_allow_html=True)
 
-        st.markdown('<div class="send-btn">', unsafe_allow_html=True)
+        st.markdown('<div class="send-btn"><div>', unsafe_allow_html=True)
         if st.button("Enter the Orb →", use_container_width=True, key="login_btn"):
             u = authenticate(username, password)
             if u:
@@ -284,7 +313,7 @@ if not st.session_state["authenticated"]:
                 st.rerun()
             else:
                 st.error("Invalid credentials.")
-        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown('</div></div>', unsafe_allow_html=True)
 
     st.stop()
 
@@ -306,11 +335,18 @@ def close_panel():
 def panel_is_open():
     return st.session_state["panel_open"] and st.session_state["panel_idx"] >= 0
 
-def start_new_chat():
+def persist_current_chat():
+    """Save current chat (messages + panels) under its existing id, or create one."""
     if st.session_state["messages"]:
-        save_chat(user["display_name"],
-                  st.session_state["messages"],
-                  st.session_state["selected_model"])
+        sid = save_chat(user["display_name"],
+                        st.session_state["messages"],
+                        st.session_state["selected_model"],
+                        st.session_state["panels"],
+                        session_id=st.session_state.get("current_chat_id"))
+        st.session_state["current_chat_id"] = sid
+
+def start_new_chat():
+    persist_current_chat()
     st.session_state["messages"]        = []
     st.session_state["panels"]          = []
     st.session_state["last_df"]         = None
@@ -321,20 +357,16 @@ def restore_chat(sid: str):
     data = load_chat(sid)
     if data:
         st.session_state["messages"]        = data["messages"]
-        st.session_state["panels"]          = [{"chart": None, "df": None, "label": ""}
-                                                for _ in range(
-                                                    len([m for m in data["messages"]
-                                                         if m["role"]=="assistant"]))]
+        st.session_state["panels"]          = data.get("panels", [])
         st.session_state["current_chat_id"] = sid
         st.session_state["selected_model"]  = data.get("model", DEFAULT_MODEL)
         st.session_state["last_df"]         = None
         close_panel()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ── SIDEBAR (Claude-style dark) ───────────────────────────────────────────────
+# ── SIDEBAR ───────────────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 with st.sidebar:
-    # Logo
     st.markdown(f"""
     <div style="display:flex;align-items:center;gap:10px;padding:16px 4px 12px;">
         <div style="width:26px;height:26px;border-radius:50%;flex-shrink:0;
@@ -345,17 +377,15 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
 
-    # New Chat button
     st.markdown('<div class="new-chat-btn">', unsafe_allow_html=True)
     if st.button("＋  New Chat", use_container_width=True, key="sb_new"):
         start_new_chat()
         st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
 
-    st.markdown(f"<div style='height:1px;background:#1F2937;margin:10px 0;'></div>",
+    st.markdown("<div style='height:1px;background:#1F2937;margin:10px 0;'></div>",
                 unsafe_allow_html=True)
 
-    # Recent chats label
     st.markdown(f"""
     <p style="font-family:'Inter',sans-serif;font-size:0.65rem;font-weight:600;
               text-transform:uppercase;letter-spacing:0.1em;color:#4B5563;
@@ -374,7 +404,6 @@ with st.sidebar:
             rc1, rc2 = st.columns([6, 1])
             with rc1:
                 label = chat["title"][:34] + ("…" if len(chat["title"])>34 else "")
-                # Highlight active chat
                 if is_active:
                     st.markdown(f"""
                     <div style="background:{SB_ACT};border-radius:8px;padding:7px 10px;margin-bottom:1px;">
@@ -384,9 +413,8 @@ with st.sidebar:
                                     font-family:'DM Mono',monospace;">{fmt_ts(chat['timestamp'])}</div>
                     </div>""", unsafe_allow_html=True)
                 else:
-                    if st.button(label, key=f"sb_chat_{chat['id']}",
-                                 use_container_width=True):
-                        start_new_chat()
+                    if st.button(label, key=f"sb_chat_{chat['id']}", use_container_width=True):
+                        persist_current_chat()
                         restore_chat(chat["id"])
                         st.rerun()
                     st.markdown(f"""
@@ -398,16 +426,17 @@ with st.sidebar:
                 if st.button("✕", key=f"sb_del_{chat['id']}"):
                     delete_chat(chat["id"])
                     if is_active:
-                        start_new_chat()
+                        st.session_state["messages"]        = []
+                        st.session_state["panels"]          = []
+                        st.session_state["current_chat_id"] = None
+                        close_panel()
                     st.rerun()
                 st.markdown('</div>', unsafe_allow_html=True)
 
-    # Push sign-out to bottom
-    st.markdown(f"<div style='flex:1;min-height:40px;'></div>", unsafe_allow_html=True)
-    st.markdown(f"<div style='height:1px;background:#1F2937;margin:10px 0;'></div>",
+    st.markdown("<div style='flex:1;min-height:30px;'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='height:1px;background:#1F2937;margin:10px 0;'></div>",
                 unsafe_allow_html=True)
 
-    # User info
     st.markdown(f"""
     <div style="padding:4px 4px 8px;">
         <div style="font-family:'Inter',sans-serif;font-size:0.80rem;
@@ -419,10 +448,7 @@ with st.sidebar:
 
     st.markdown('<div class="signout-btn">', unsafe_allow_html=True)
     if st.button("↩  Sign out", use_container_width=True, key="sb_signout"):
-        if st.session_state["messages"]:
-            save_chat(user["display_name"],
-                      st.session_state["messages"],
-                      st.session_state["selected_model"])
+        persist_current_chat()
         for k in ["authenticated","user","messages","panels","panel_open",
                   "panel_idx","input_key","selected_model","last_df","current_chat_id"]:
             st.session_state.pop(k, None)
@@ -471,54 +497,48 @@ with chat_col:
     with st.container():
         if not msgs:
             st.markdown(f"""
-            <div style="text-align:center;padding:48px 20px 32px;">
+            <div style="text-align:center;padding:48px 20px 28px;">
                 <div style="font-family:'DM Mono',monospace;font-size:0.60rem;letter-spacing:0.2em;
                             text-transform:uppercase;color:rgba(217,119,6,0.7);margin-bottom:8px;">
                     Good to see you, {user['display_name'].split()[0]}</div>
                 <div style="font-family:'Syne',sans-serif;font-size:1.4rem;font-weight:700;
                             color:{TEXT};margin-bottom:6px;">What would you like to know?</div>
                 <div style="font-family:'Inter',sans-serif;font-size:0.80rem;color:{SUBTEXT};
-                            max-width:380px;margin:0 auto 24px;">
+                            max-width:380px;margin:0 auto 20px;">
                     Ask anything — incentive performance, headcount, PMGM ratings,
                     or cross-source insights.</div>
             </div>""", unsafe_allow_html=True)
 
             SUGGESTIONS = [
-                ("📊", "Max payout attainment",    "What % of employees hit max payout this cycle?"),
-                ("⚠️", "Consistent underperformers","Who has missed targets for 3+ consecutive periods?"),
-                ("⭐", "PMGM distribution",         "Show me the PMGM rating distribution"),
-                ("🔍", "Non-active cross-check",    "Are there non-active employees with payouts?"),
-                ("📋", "Cycle summary",             "Give me a cycle summary"),
-                ("🌏", "Country comparison",        "Compare countries on incentive attainment"),
+                "What % of employees hit max payout this cycle?",
+                "Who has missed targets for 3+ consecutive periods?",
+                "Show me the PMGM rating distribution",
+                "Are there non-active employees with payouts?",
+                "Give me a cycle summary",
+                "Compare countries on incentive attainment",
             ]
-            r1 = st.columns(3)
-            r2 = st.columns(3)
-            for i, (icon, label, query) in enumerate(SUGGESTIONS):
-                with (r1 if i < 3 else r2)[i % 3]:
+            # Centered grid: side-padding columns + 3 content columns, 2 rows
+            pad, c1, c2, c3, pad2 = st.columns([0.5, 1, 1, 1, 0.5])
+            content_cols = [c1, c2, c3]
+            for i, query in enumerate(SUGGESTIONS):
+                col = content_cols[i % 3]
+                with col:
                     st.markdown('<div class="sug-card">', unsafe_allow_html=True)
-                    if st.button(f"{icon}  {label}", key=f"sug_{i}",
-                                 use_container_width=True, help=query):
+                    if st.button(query, key=f"sug_{i}", use_container_width=True):
                         st.session_state["messages"].append({"role":"user","content":query})
                         st.session_state["_pending_question"] = query
                         st.rerun()
                     st.markdown('</div>', unsafe_allow_html=True)
-                    st.markdown(f"""
-                    <div style="font-family:'Inter',sans-serif;font-size:0.67rem;
-                                color:{SUBTEXT};padding:2px 2px 10px;line-height:1.3;">{query}</div>
-                    """, unsafe_allow_html=True)
+                if i == 2:
+                    # spacing before second row
+                    pad, c1, c2, c3, pad2 = st.columns([0.5, 1, 1, 1, 0.5])
+                    content_cols = [c1, c2, c3]
 
-        # Render history
+        # ── Render history ────────────────────────────────────────────────────
         assistant_idx = 0
         for i, msg in enumerate(msgs):
             if msg["role"] == "user":
-                st.markdown(f"""
-                <div style="display:flex;justify-content:flex-end;margin:14px 0 4px;">
-                    <div style="background:{USERBG};border:1px solid {BORDER};
-                                border-radius:16px 16px 4px 16px;padding:10px 15px;
-                                max-width:72%;font-family:'Inter',sans-serif;
-                                font-size:0.88rem;color:{TEXT};line-height:1.55;">
-                        {msg['content']}</div>
-                </div>""", unsafe_allow_html=True)
+                render_user_bubble(msg["content"])
             else:
                 has_panel = (assistant_idx < len(panels) and
                     (panels[assistant_idx].get("chart") is not None or
@@ -526,16 +546,15 @@ with chat_col:
                 panel_label       = panels[assistant_idx].get("label","") if assistant_idx < len(panels) else ""
                 current_panel_idx = assistant_idx
 
+                content_html = msg["content"].replace("\n", "<br>")
                 st.markdown(f"""
                 <div style="display:flex;align-items:flex-start;gap:8px;margin:4px 0 6px;">
-                    <div style="width:24px;height:24px;border-radius:50%;flex-shrink:0;margin-top:3px;
-                        background:radial-gradient(circle at 38% 35%,#fff8e0 0%,#F9A602 30%,#c97f00 60%,#3d1f00 100%);
-                        box-shadow:0 0 6px rgba(217,119,6,0.28);"></div>
+                    <div style="width:24px;height:24px;border-radius:50%;flex-shrink:0;margin-top:3px;{ASSISTANT_AVATAR}"></div>
                     <div style="background:{CARD};border:1px solid {BORDER};
                                 border-radius:4px 16px 16px 16px;padding:12px 16px;
                                 max-width:84%;font-family:'Inter',sans-serif;font-size:0.88rem;
                                 color:{TEXT};line-height:1.65;box-shadow:0 1px 4px rgba(0,0,0,0.05);">
-                        {msg['content']}</div>
+                        {content_html}</div>
                 </div>""", unsafe_allow_html=True)
 
                 if has_panel:
@@ -549,19 +568,20 @@ with chat_col:
 
                 assistant_idx += 1
 
-    # ── INPUT ──────────────────────────────────────────────────────────────────
+    # ── INPUT (form — Enter submits) ─────────────────────────────────────────
     st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
-    ic, bc = st.columns([5, 1])
-    with ic:
-        question = st.text_input(
-            "q", placeholder="Ask anything about your workforce…",
-            key=f"chat_input_{st.session_state['input_key']}",
-            label_visibility="collapsed",
-        )
-    with bc:
-        st.markdown('<div class="send-btn">', unsafe_allow_html=True)
-        send = st.button("Send →", use_container_width=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+    with st.form(key="chat_form", clear_on_submit=True):
+        ic, bc = st.columns([5, 1])
+        with ic:
+            question = st.text_input(
+                "q", placeholder="Ask anything about your workforce…",
+                key=f"chat_input_{st.session_state['input_key']}",
+                label_visibility="collapsed",
+            )
+        with bc:
+            st.markdown('<div class="send-btn">', unsafe_allow_html=True)
+            send = st.form_submit_button("Send →", use_container_width=True)
+            st.markdown('</div>', unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ── PROCESS QUESTION ──────────────────────────────────────────────────────────
@@ -578,43 +598,48 @@ if pending:
     history = [m for m in st.session_state["messages"][:-1]
                if m["role"] in ("user", "assistant")]
 
-    # ── Streaming response ────────────────────────────────────────────────────
-    try:
-        stream, chart, df = answer(
-            q, history, user,
-            model_name=st.session_state.get("selected_model", DEFAULT_MODEL),
-            last_df=st.session_state.get("last_df"),
-        )
+    with chat_col:
+        # ── Thinking placeholder — single self-contained block ───────────────
+        think_box = st.empty()
+        think_box.markdown(f"""
+        <div style="display:flex;align-items:center;gap:10px;margin:6px 0 6px;">
+            <div style="width:24px;height:24px;border-radius:50%;flex-shrink:0;{ASSISTANT_AVATAR}"></div>
+            <div style="background:{CARD};border:1px solid {BORDER};border-radius:4px 16px 16px 16px;
+                        padding:13px 18px;box-shadow:0 1px 4px rgba(0,0,0,0.05);">
+                <span class="thinking-dot"></span><span class="thinking-dot"></span><span class="thinking-dot"></span>
+            </div>
+        </div>""", unsafe_allow_html=True)
 
-        # Render the streaming bubble
-        with chat_col:
-            st.markdown(f"""
-            <div style="display:flex;align-items:flex-start;gap:8px;margin:4px 0 6px;">
-                <div style="width:24px;height:24px;border-radius:50%;flex-shrink:0;margin-top:3px;
-                    background:radial-gradient(circle at 38% 35%,#fff8e0 0%,#F9A602 30%,#c97f00 60%,#3d1f00 100%);
-                    box-shadow:0 0 6px rgba(217,119,6,0.28);"></div>
-                <div style="background:{CARD};border:1px solid {BORDER};
-                            border-radius:4px 16px 16px 16px;padding:12px 16px;
-                            min-width:120px;max-width:84%;font-family:'Inter',sans-serif;
-                            font-size:0.88rem;color:{TEXT};line-height:1.65;
-                            box-shadow:0 1px 4px rgba(0,0,0,0.05);">
-            """, unsafe_allow_html=True)
+        # ── Prepare answer (sync retrieval + chart build happens here) ──────
+        try:
+            stream, chart, df = answer(
+                q, history, user,
+                model_name=st.session_state.get("selected_model", DEFAULT_MODEL),
+                last_df=st.session_state.get("last_df"),
+            )
 
-            # Stream into the bubble — collect full text
+            # Clear the thinking placeholder, then stream the response below it
+            think_box.empty()
+            avatar_row = st.empty()
+            avatar_row.markdown(f"""
+            <div style="display:flex;align-items:center;gap:10px;margin:6px 0 2px;">
+                <div style="width:24px;height:24px;border-radius:50%;flex-shrink:0;{ASSISTANT_AVATAR}"></div>
+                <span style="font-family:'DM Mono',monospace;font-size:0.62rem;color:{SUBTEXT};
+                             letter-spacing:0.1em;text-transform:uppercase;">Orb</span>
+            </div>""", unsafe_allow_html=True)
             collected = st.write_stream(stream)
             text = clean_md(collected or "")
 
-            st.markdown("</div></div>", unsafe_allow_html=True)
+        except Exception as e:
+            think_box.empty()
+            st.error(f"Sorry, I ran into an issue: {str(e)}")
+            text  = f"Sorry, I ran into an issue: {str(e)}"
+            chart = None
+            df    = None
 
-    except Exception as e:
-        text  = f"Sorry, I ran into an issue: {str(e)}"
-        chart = None
-        df    = None
-
-    # Fallback: if text is blank after streaming, generate a summary
+    # ── Fallback for blank text ──────────────────────────────────────────────
     if not text.strip() and df is not None:
         try:
-            from ai_engine import call_model, MODELS
             fb_system = "You are a concise analyst. Summarise the data in 2-3 plain sentences, no markdown bold or italic."
             fb_msgs   = [{"role": "user", "content": f"Summarise this data for an executive:\n{df.head(20).to_string(index=False)}"}]
             text = clean_md(call_model(fb_msgs, fb_system,
@@ -639,6 +664,9 @@ if pending:
         new_idx = len([m for m in st.session_state["messages"]
                        if m["role"] == "assistant"]) - 1
         open_panel(new_idx)
+
+    # Persist after every turn so a chat is never lost
+    persist_current_chat()
 
     st.session_state["input_key"] += 1
     st.rerun()
@@ -672,7 +700,9 @@ if panel_is_open() and panel_col is not None:
                            text-transform:uppercase;color:{SUBTEXT};padding:4px 0 4px 2px;">Data</p>
                 """, unsafe_allow_html=True)
                 dc = df_show.copy()
-                dc[dc.select_dtypes("number").columns] = dc.select_dtypes("number").round(2)
+                num_cols = dc.select_dtypes("number").columns
+                if len(num_cols) > 0:
+                    dc[num_cols] = dc[num_cols].round(2)
                 st.dataframe(dc, use_container_width=True, height=280)
 
         st.markdown("<div style='padding:8px 0 16px;'>", unsafe_allow_html=True)
