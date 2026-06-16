@@ -124,10 +124,11 @@ def retrieve_data(intent: str, countries: list, question: str):
     elif intent == "proration":
         df = proration_summary(countries)
         df = _add_names(df, countries)
+        show_cols = [c for c in ["EmployeeID","EmployeeName","Cycle","ProrFactor","PayoutLost"] if c in df.columns]
         return df, (f"Attendance proration data, scope: {scope}.\n"
                     f"Affected: {df['EmployeeID'].nunique()} employees, "
                     f"total payout impact: {df['PayoutLost'].sum():,.2f}\n"
-                    f"{df[['EmployeeID','EmployeeName','Cycle','ProrFactor','PayoutLost']].head(40).to_string(index=False)}")
+                    f"{df[show_cols].head(40).to_string(index=False)}")
 
     elif intent == "anomaly":
         high_low, low_high, cycle = anomaly_summary(countries)
@@ -142,9 +143,9 @@ def retrieve_data(intent: str, countries: list, question: str):
         joined = get_joined(countries)
         latest = joined["Cycle"].max()
         fr_l   = joined[joined["Cycle"] == latest]
-        df     = fr_l[(fr_l["EmployeeStatus"]=="Non-Active") & (fr_l["TotalCyclePayout"]>0)]\
-                    [["EmployeeID","EmployeeName","Country","LastDate","TotalCyclePayout","Cycle"]]\
-                    .drop_duplicates("EmployeeID")
+        base_cols = ["EmployeeID","EmployeeName","Country","LastDate","TotalCyclePayout","Cycle"]
+        avail_cols = [c for c in base_cols if c in fr_l.columns]
+        df     = fr_l[(fr_l["EmployeeStatus"]=="Non-Active") & (fr_l["TotalCyclePayout"]>0)]                    [avail_cols]                    .drop_duplicates("EmployeeID")
         return df, f"Non-active employees with payouts in latest cycle, scope: {scope}.\n{df.to_string(index=False)}"
 
     elif intent == "new_joiner":
@@ -155,7 +156,8 @@ def retrieve_data(intent: str, countries: list, question: str):
         latest = fr["Cycle"].max()
         fr_l   = fr[fr["Cycle"]==latest].drop_duplicates("EmployeeID")
         df     = new.merge(fr_l[["EmployeeID","Scheme","TotalCyclePayout","ProrFactor"]], on="EmployeeID", how="left")
-        return df, f"New joiners (last 6 months) on incentive, scope: {scope}.\n{df[['EmployeeID','EmployeeName','JoinDate','Country','Scheme','TotalCyclePayout','ProrFactor']].to_string(index=False)}"
+        show_cols = [c for c in ["EmployeeID","EmployeeName","JoinDate","Country","Scheme","TotalCyclePayout","ProrFactor"] if c in df.columns]
+        return df, f"New joiners (last 6 months) on incentive, scope: {scope}.\n{df[show_cols].to_string(index=False)}"
 
     elif intent == "headcount":
         fh   = get_flash_home(countries)
