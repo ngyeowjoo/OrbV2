@@ -34,7 +34,8 @@ def get_joined(countries: list[str]) -> pd.DataFrame:
     """Flash Reward joined with Flash Home — country scoped."""
     fh = get_flash_home(countries)
     fr = get_flash_reward(countries)
-    return fr.merge(fh[["EmployeeID", "EmployeeName", "Country", "Project", "EmployeeStatus",
+    name_col = ["EmployeeName"] if "EmployeeName" in fh.columns else []
+    return fr.merge(fh[["EmployeeID"] + name_col + ["Country", "Project", "EmployeeStatus",
                          "JoinDate", "LastDate", "PMGMRating"]],
                     on="EmployeeID", how="left")
 
