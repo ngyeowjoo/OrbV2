@@ -6,25 +6,37 @@ Swap load_data() for a MySQL connector in production.
 import pandas as pd
 import streamlit as st
 from pathlib import Path
+import hashlib
 
 DATA_FILE = Path(__file__).parent / "mock_data.xlsx"
 
-# ── LOAD (cached) ─────────────────────────────────────────────────────────────
-@st.cache_data
-def load_data():
+def _file_hash() -> str:
+    """MD5 of the Excel file — used to bust Streamlit's data cache when file changes."""
+    try:
+        return hashlib.md5(DATA_FILE.read_bytes()).hexdigest()
+    except Exception:
+        return "unknown"
+
+@st.cache_data(ttl=0)   # ttl=0 means: re-read on every app restart, no stale cache
+def load_data(_cache_key: str = ""):
+    """_cache_key is the file hash — changing it forces a cache bust."""
     fh = pd.read_excel(DATA_FILE, sheet_name="flash_home",   parse_dates=["JoinDate", "LastDate"])
     fr = pd.read_excel(DATA_FILE, sheet_name="flash_reward")
     return fh, fr
 
+def get_data():
+    """Always passes the current file hash so the cache reloads when mock_data.xlsx changes."""
+    return load_data(_cache_key=_file_hash())
+
 # ── COUNTRY-SCOPED ACCESSORS ──────────────────────────────────────────────────
 def get_flash_home(countries: list[str]) -> pd.DataFrame:
-    fh, _ = load_data()
+    fh, _ = get_data()
     if "ALL" in countries:
         return fh.copy()
     return fh[fh["Country"].isin(countries)].copy()
 
 def get_flash_reward(countries: list[str]) -> pd.DataFrame:
-    fh, fr = load_data()
+    fh, fr = get_data()
     if "ALL" not in countries:
         allowed_ids = fh[fh["Country"].isin(countries)]["EmployeeID"]
         fr = fr[fr["EmployeeID"].isin(allowed_ids)]
