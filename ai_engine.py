@@ -81,19 +81,26 @@ def detect_intent(question: str) -> str:
 
 # ── EMPLOYEE NAME ENRICHMENT ──────────────────────────────────────────────────
 def _add_names(df, countries):
-    """Merge EmployeeName from Flash Home, placed right after EmployeeID."""
+    """Merge EmployeeName from Flash Home, placed right after EmployeeID.
+    Safe if EmployeeName is missing from the source (e.g. old mock_data.xlsx)."""
     if df is None or df.empty or "EmployeeID" not in df.columns:
         return df
     if "EmployeeName" in df.columns:
         return df
-    from data import get_flash_home
-    fh = get_flash_home(countries)[["EmployeeID", "EmployeeName"]]
-    df = df.merge(fh, on="EmployeeID", how="left")
-    cols = df.columns.tolist()
-    cols.remove("EmployeeName")
-    idx = cols.index("EmployeeID") + 1
-    cols.insert(idx, "EmployeeName")
-    return df[cols]
+    try:
+        from data import get_flash_home
+        fh = get_flash_home(countries)
+        if "EmployeeName" not in fh.columns:
+            return df   # source doesn't have names yet — skip silently
+        fh = fh[["EmployeeID", "EmployeeName"]]
+        df = df.merge(fh, on="EmployeeID", how="left")
+        cols = df.columns.tolist()
+        cols.remove("EmployeeName")
+        idx = cols.index("EmployeeID") + 1
+        cols.insert(idx, "EmployeeName")
+        return df[cols]
+    except Exception:
+        return df   # never crash the app over a name lookup
 
 # ── DATA RETRIEVAL ────────────────────────────────────────────────────────────
 def retrieve_data(intent: str, countries: list, question: str):
