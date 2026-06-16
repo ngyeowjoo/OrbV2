@@ -54,6 +54,7 @@ def get_joined(countries: list[str]) -> pd.DataFrame:
 # ── SUMMARY HELPERS (used by intent handlers) ─────────────────────────────────
 def attainment_summary(countries):
     fr = get_flash_reward(countries)
+    fh = get_flash_home(countries)
     latest = fr["Cycle"].max()
     cyc    = fr[fr["Cycle"] == latest].drop_duplicates(["EmployeeID", "Cycle"])
     cyc    = cyc.groupby("EmployeeID").agg(
@@ -62,10 +63,14 @@ def attainment_summary(countries):
         Scheme=("Scheme",                     "first"),
     ).reset_index()
     cyc["HitMax"] = cyc["TotalCyclePayout"] >= cyc["SchemeMaxPayout"] * 0.999
+    # Enrich with name, country, project from Flash Home
+    name_cols = [c for c in ["EmployeeID","EmployeeName","Country","Project"] if c in fh.columns]
+    cyc = cyc.merge(fh[name_cols], on="EmployeeID", how="left")
     return cyc, latest
 
 def underperformer_summary(countries, min_cycles=3):
     fr = get_flash_reward(countries)
+    fh = get_flash_home(countries)
     fr["BelowTarget"] = fr["Achieved"] < fr["Target"]
     emp_cycle = fr.groupby(["EmployeeID", "Cycle"])["BelowTarget"].any().reset_index()
     emp_cycle = emp_cycle.sort_values(["EmployeeID", "Cycle"])
@@ -82,15 +87,24 @@ def underperformer_summary(countries, min_cycles=3):
                 consecutive = 0
         if max_consec >= min_cycles:
             results.append({"EmployeeID": emp, "MaxConsecutiveMisses": max_consec})
-    return pd.DataFrame(results)
+    df = pd.DataFrame(results)
+    if df.empty:
+        return df
+    name_cols = [c for c in ["EmployeeID","EmployeeName","Country","Project"] if c in fh.columns]
+    df = df.merge(fh[name_cols], on="EmployeeID", how="left")
+    return df
 
 def qualifier_summary(countries):
     fr = get_flash_reward(countries)
+    fh = get_flash_home(countries)
     failed = fr[fr["QualifierFailed"] != ""].copy()
-    return failed.groupby(["EmployeeID", "QualifierFailed"]).agg(
+    df = failed.groupby(["EmployeeID", "QualifierFailed"]).agg(
         TimesFailed=("Cycle", "count"),
         TotalPayoutBlocked=("MetricPayout", "sum")
     ).reset_index()
+    name_cols = [c for c in ["EmployeeID","EmployeeName","Country"] if c in fh.columns]
+    df = df.merge(fh[name_cols], on="EmployeeID", how="left")
+    return df
 
 def proration_summary(countries):
     fr = get_flash_reward(countries)
@@ -106,7 +120,8 @@ def anomaly_summary(countries):
         TotalCyclePayout=("TotalCyclePayout", "first"),
         SchemeMaxPayout=("SchemeMaxPayout",   "first"),
     ).reset_index()
-    merged = cyc.merge(fh[["EmployeeID", "PMGMRating"]], on="EmployeeID", how="inner")
+    name_cols = [c for c in ["EmployeeID","EmployeeName","Country","PMGMRating"] if c in fh.columns]
+    merged = cyc.merge(fh[name_cols], on="EmployeeID", how="inner")
     merged["PayoutPct"] = merged["TotalCyclePayout"] / merged["SchemeMaxPayout"]
     top_ratings   = ["Exceptional", "Exceeds Expectations"]
     bottom_ratings= ["Below Expectations", "Unsatisfactory"]
