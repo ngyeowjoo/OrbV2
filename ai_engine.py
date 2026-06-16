@@ -79,6 +79,22 @@ def detect_intent(question: str) -> str:
             return intent
     return "free_form"
 
+# ── EMPLOYEE NAME ENRICHMENT ──────────────────────────────────────────────────
+def _add_names(df, countries):
+    """Merge EmployeeName from Flash Home, placed right after EmployeeID."""
+    if df is None or df.empty or "EmployeeID" not in df.columns:
+        return df
+    if "EmployeeName" in df.columns:
+        return df
+    from data import get_flash_home
+    fh = get_flash_home(countries)[["EmployeeID", "EmployeeName"]]
+    df = df.merge(fh, on="EmployeeID", how="left")
+    cols = df.columns.tolist()
+    cols.remove("EmployeeName")
+    idx = cols.index("EmployeeID") + 1
+    cols.insert(idx, "EmployeeName")
+    return df[cols]
+
 # ── DATA RETRIEVAL ────────────────────────────────────────────────────────────
 def retrieve_data(intent: str, countries: list, question: str):
     from data import (attainment_summary, underperformer_summary,
@@ -88,26 +104,30 @@ def retrieve_data(intent: str, countries: list, question: str):
 
     if intent == "attainment":
         df, cycle = attainment_summary(countries)
+        df = _add_names(df, countries)
         return df, f"Incentive attainment data for cycle {cycle}, scope: {scope}.\n{df.to_string(index=False)}"
 
     elif intent == "underperformance":
         df = underperformer_summary(countries)
         fh = get_flash_home(countries)[["EmployeeID","Country","Project"]]
         df = df.merge(fh, on="EmployeeID", how="left")
+        df = _add_names(df, countries)
         return df, f"Employees with >=3 consecutive cycles below target, scope: {scope}.\n{df.to_string(index=False)}"
 
     elif intent == "qualifier":
         df = qualifier_summary(countries)
         fh = get_flash_home(countries)[["EmployeeID","Country"]]
         df = df.merge(fh, on="EmployeeID", how="left")
+        df = _add_names(df, countries)
         return df, f"Qualifier failure data, scope: {scope}.\n{df.to_string(index=False)}"
 
     elif intent == "proration":
         df = proration_summary(countries)
+        df = _add_names(df, countries)
         return df, (f"Attendance proration data, scope: {scope}.\n"
                     f"Affected: {df['EmployeeID'].nunique()} employees, "
                     f"total payout impact: {df['PayoutLost'].sum():,.2f}\n"
-                    f"{df[['EmployeeID','Cycle','ProrFactor','PayoutLost']].head(40).to_string(index=False)}")
+                    f"{df[['EmployeeID','EmployeeName','Cycle','ProrFactor','PayoutLost']].head(40).to_string(index=False)}")
 
     elif intent == "anomaly":
         high_low, low_high, cycle = anomaly_summary(countries)
@@ -115,6 +135,7 @@ def retrieve_data(intent: str, countries: list, question: str):
             high_low.assign(AnomalyType="High PMGM / Low Payout"),
             low_high.assign(AnomalyType="Low PMGM / High Payout"),
         ])
+        df = _add_names(df, countries)
         return df, f"Performance vs payout anomaly for cycle {cycle}, scope: {scope}.\n{df.to_string(index=False)}"
 
     elif intent == "cross_check":
@@ -122,7 +143,7 @@ def retrieve_data(intent: str, countries: list, question: str):
         latest = joined["Cycle"].max()
         fr_l   = joined[joined["Cycle"] == latest]
         df     = fr_l[(fr_l["EmployeeStatus"]=="Non-Active") & (fr_l["TotalCyclePayout"]>0)]\
-                    [["EmployeeID","Country","LastDate","TotalCyclePayout","Cycle"]]\
+                    [["EmployeeID","EmployeeName","Country","LastDate","TotalCyclePayout","Cycle"]]\
                     .drop_duplicates("EmployeeID")
         return df, f"Non-active employees with payouts in latest cycle, scope: {scope}.\n{df.to_string(index=False)}"
 
@@ -134,7 +155,7 @@ def retrieve_data(intent: str, countries: list, question: str):
         latest = fr["Cycle"].max()
         fr_l   = fr[fr["Cycle"]==latest].drop_duplicates("EmployeeID")
         df     = new.merge(fr_l[["EmployeeID","Scheme","TotalCyclePayout","ProrFactor"]], on="EmployeeID", how="left")
-        return df, f"New joiners (last 6 months) on incentive, scope: {scope}.\n{df[['EmployeeID','JoinDate','Country','Scheme','TotalCyclePayout','ProrFactor']].to_string(index=False)}"
+        return df, f"New joiners (last 6 months) on incentive, scope: {scope}.\n{df[['EmployeeID','EmployeeName','JoinDate','Country','Scheme','TotalCyclePayout','ProrFactor']].to_string(index=False)}"
 
     elif intent == "headcount":
         fh   = get_flash_home(countries)
@@ -167,7 +188,8 @@ def retrieve_data(intent: str, countries: list, question: str):
                    f"Average payout as % of max: {avg_pct:.1%}\n"
                    f"Hit max payout: {hit_max} ({hit_max/len(cyc):.1%})\n"
                    f"Qualifier failures: {q_fail}\nProrated for attendance: {prorat}\n")
-        return cyc[["EmployeeID","Scheme","TotalCyclePayout","SchemeMaxPayout","ProrFactor"]].head(50), desc
+        result_df = _add_names(cyc[["EmployeeID","Scheme","TotalCyclePayout","SchemeMaxPayout","ProrFactor"]].head(50), countries)
+        return result_df, desc
 
     elif intent == "country_compare":
         fr     = get_flash_reward(countries)
@@ -213,12 +235,13 @@ def build_chart(intent: str, df):
             fig.update_layout(**PLOT_THEME, yaxis_title="% Hit Max"); _fmt_axes(fig); return fig
 
         elif intent == "underperformance":
+            x_col = "EmployeeName" if "EmployeeName" in df.columns else "EmployeeID"
             fig = px.bar(df.sort_values("MaxConsecutiveMisses", ascending=False).head(20),
-                         x="EmployeeID", y="MaxConsecutiveMisses",
+                         x=x_col, y="MaxConsecutiveMisses",
                          color="Country" if "Country" in df.columns else None,
                          title="Consecutive Cycles Below Target (Top 20)",
                          color_discrete_sequence=PALETTE)
-            fig.update_layout(**PLOT_THEME); _fmt_axes(fig); return fig
+            fig.update_layout(**PLOT_THEME, xaxis_title="Employee"); _fmt_axes(fig); return fig
 
         elif intent == "qualifier":
             top = df.groupby("QualifierFailed")["TimesFailed"].sum().reset_index()
@@ -271,10 +294,11 @@ def build_chart(intent: str, df):
 
         elif intent == "cross_check":
             if df.empty: return None
-            fig = px.bar(df, x="EmployeeID", y="TotalCyclePayout",
+            x_col = "EmployeeName" if "EmployeeName" in df.columns else "EmployeeID"
+            fig = px.bar(df, x=x_col, y="TotalCyclePayout",
                          title="Non-Active Employees with Payouts",
                          color_discrete_sequence=[C_BAD])
-            fig.update_layout(**PLOT_THEME); _fmt_axes(fig); return fig
+            fig.update_layout(**PLOT_THEME, xaxis_title="Employee"); _fmt_axes(fig); return fig
 
     except Exception:
         return None
@@ -446,6 +470,7 @@ Rules:
 - Be concise and executive-grade. Lead with the insight.
 - Flag concerning data clearly.
 - Reference specific numbers from the data.
+- When the data includes EmployeeName, refer to employees by name (not EmployeeID) in your narrative. You may mention EmployeeID alongside the name for cross-referencing if helpful (e.g. "Aisyah Torres (E0001)").
 - Do NOT use markdown bold (**) or italic (*) formatting.
 - Do NOT mention SQL, dataframes, or technical details.
 - Always write a response — never return an empty string.
