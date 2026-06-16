@@ -64,6 +64,7 @@ INTENT_PATTERNS = {
     "anomaly":          r"(anomaly|mismatch|high.*rating.*low|low.*rating.*high|pmgm.*payout|payout.*pmgm)",
     "cross_check":      r"(non.?active|inactive|left.*payout|payout.*left|leaver|exit)",
     "new_joiner":       r"(new joiner|first cycle|recently joined|new hire)",
+    "cross_join":       r"(who are (they|those|these|them)|show.*their name|identify them|name them|which employee|tell me who|who (is|are) (it|that|this)|give me their name)",
     "employee_list":    r"(show.*name|list.*name|employee.*name|name.*employee|who are|all employee|employee list|staff list|roster|directory)",
     "headcount":        r"(headcount|how many|count|active.*employee|employee.*active|workforce size)",
     "attrition":        r"(attrition|left|resign|turnover|leavers)",
@@ -175,6 +176,24 @@ def retrieve_data(intent: str, countries: list, question: str):
         has_names = "EmployeeName" in df.columns
         return df, (f"Employee directory, scope: {scope}. Total: {len(df)} employees.\n"
                     f"{'EmployeeName is included in the data.' if has_names else 'Note: EmployeeName not available.'}\n"
+                    f"{df.to_string(index=False)}")
+
+    elif intent == "cross_join":
+        # Follow-up intent: user wants to identify employees from a prior result.
+        # Do a full joined lookup of latest cycle with names.
+        fr  = get_flash_reward(countries)
+        fh  = get_flash_home(countries)
+        latest = fr["Cycle"].max()
+        cyc = fr[fr["Cycle"] == latest].drop_duplicates("EmployeeID")
+        name_cols = [c for c in ["EmployeeID","EmployeeName","Country","Project",
+                                  "EmployeeStatus","PMGMRating"] if c in fh.columns]
+        df = cyc.merge(fh[name_cols], on="EmployeeID", how="left")
+        show = [c for c in ["EmployeeID","EmployeeName","Scheme","TotalCyclePayout",
+                             "SchemeMaxPayout","QualifierFailed","ProrFactor",
+                             "Country","Project","PMGMRating"] if c in df.columns]
+        df = df[show]
+        return df, (f"Full employee-level joined data for cycle {latest}, scope: {scope}.\n"
+                    f"Use this to identify specific employees from the prior question.\n"
                     f"{df.to_string(index=False)}")
 
     elif intent == "headcount":
@@ -467,7 +486,17 @@ def answer(question: str, history: list, user: dict,
     if (intent == "free_form" or df is None) and last_df is not None:
         try:
             data_context += f"\n\nPrevious query result (use for follow-up reasoning):\n{last_df.to_string(index=False)}"
-            if df is None:
+            # If last_df has EmployeeID but no payout/name data, proactively enrich
+            if "EmployeeID" in last_df.columns and "EmployeeName" not in last_df.columns:
+                from data import get_flash_home
+                fh = get_flash_home(countries)
+                name_cols = [c for c in ["EmployeeID","EmployeeName"] if c in fh.columns]
+                if len(name_cols) > 1:
+                    enriched = last_df.merge(fh[name_cols], on="EmployeeID", how="left")
+                    data_context += f"\n\nSame data with employee names added:\n{enriched.to_string(index=False)}"
+                    if df is None:
+                        df = enriched
+            elif df is None:
                 df = last_df
         except Exception:
             pass
