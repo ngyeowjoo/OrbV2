@@ -644,6 +644,20 @@ Data context:
 {data_context}
 """
 
+    # ── Debug info package (passed back so app.py can log it) ─────────────────
+    retrieval_mode = (
+        "fresh_join"  if (needs_fresh or is_followup) else
+        "vector"      if use_vector else
+        "live_query"
+    )
+    debug_info = {
+        "routing":        routing,
+        "intent":         intent,
+        "retrieval_mode": retrieval_mode,
+        "data_context":   data_context,
+        "system_prompt":  system,
+    }
+
     messages = history[-10:] + [{"role": "user", "content": question}]
     stream   = stream_model(messages, system, model_name)
-    return stream, chart, df
+    return stream, chart, df, debug_info
