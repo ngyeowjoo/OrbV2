@@ -187,6 +187,7 @@ for k, v in {
     "selected_model":  DEFAULT_MODEL,
     "last_df":         None,
     "current_chat_id": None,
+    "vector_index_built": False,   # tracks whether FAISS index is ready
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -197,6 +198,25 @@ def clean_md(text: str) -> str:
     text = re.sub(r'__(.+?)__',     r'\1', text)
     text = re.sub(r'_(.+?)_',       r'\1', text)
     return text.strip()
+
+# ── Phase 2: Build vector index once per app session ─────────────────────────
+def _maybe_build_vector_index():
+    """Build FAISS index on first run. Shows a status message, not a blocking spinner."""
+    from vector_store import VECTOR_STORE_ENABLED, build_index, status as vs_status
+    if not VECTOR_STORE_ENABLED:
+        return
+    if st.session_state["vector_index_built"]:
+        return
+    vs = vs_status()
+    if vs["fr_indexed"] > 0:
+        st.session_state["vector_index_built"] = True
+        return
+    # Build it — this is the slow step (model download on first cold start)
+    from data import get_data
+    fh, fr = get_data()
+    with st.spinner("Building search index… (first load only, ~30s on cold start)"):
+        build_index(fh, fr)
+    st.session_state["vector_index_built"] = True
 
 ASSISTANT_AVATAR = (
     "background:radial-gradient(circle at 38% 35%,#fff8e0 0%,#F9A602 30%,#c97f00 60%,#3d1f00 100%);"
@@ -323,6 +343,9 @@ if not st.session_state["authenticated"]:
 user   = st.session_state["user"]
 msgs   = st.session_state["messages"]
 panels = st.session_state["panels"]
+
+# Build vector index if not already done this session
+_maybe_build_vector_index()
 
 def open_panel(idx):
     st.session_state["panel_open"] = True
@@ -612,7 +635,7 @@ if pending:
 
         # ── Prepare answer (sync retrieval + chart build happens here) ──────
         try:
-            stream, chart, df = answer(
+            stream, chart, df, debug_info = answer(
                 q, history, user,
                 model_name=st.session_state.get("selected_model", DEFAULT_MODEL),
                 last_df=st.session_state.get("last_df"),
@@ -633,9 +656,10 @@ if pending:
         except Exception as e:
             think_box.empty()
             st.error(f"Sorry, I ran into an issue: {str(e)}")
-            text  = f"Sorry, I ran into an issue: {str(e)}"
-            chart = None
-            df    = None
+            text       = f"Sorry, I ran into an issue: {str(e)}"
+            chart      = None
+            df         = None
+            debug_info = {}
 
     # ── Fallback for blank text ──────────────────────────────────────────────
     if not text.strip() and df is not None:
@@ -651,6 +675,21 @@ if pending:
         text = "No data was found for your query within your permitted scope."
 
     st.session_state["messages"].append({"role": "assistant", "content": text})
+
+    # ── Log to debug panel ────────────────────────────────────────────────────
+    try:
+        from debug_logger import log_interaction
+        log_interaction(
+            question       = q,
+            routing        = debug_info.get("routing", {}),
+            retrieval_mode = debug_info.get("retrieval_mode", "unknown"),
+            intent         = debug_info.get("intent", "unknown"),
+            data_context   = debug_info.get("data_context", ""),
+            system_prompt  = debug_info.get("system_prompt", ""),
+            ai_response    = text,
+        )
+    except Exception:
+        pass   # never crash the main app over debug logging
 
     if df is not None:
         st.session_state["last_df"] = df
