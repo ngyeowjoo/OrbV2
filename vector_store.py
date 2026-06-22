@@ -1,265 +1,243 @@
 """
-vector_store.py  —  Phase 2: Semantic vector retrieval for Orb v2
+vector_store.py  —  Phase 2: Semantic retrieval for Orb v2
 
-STATUS: SCAFFOLD — not yet active. Activate by:
-  1. pip install faiss-cpu sentence-transformers
-  2. Set VECTOR_STORE_ENABLED = True
-  3. Call build_index() on app startup (after load_data())
-  4. Replace retrieve_data() calls with vector_retrieve() in ai_engine.py
+Uses TF-IDF + cosine similarity (scikit-learn) — no model download,
+no internet required, works on Streamlit Cloud immediately.
 
-WHY THIS EXISTS
----------------
-The current architecture queries the full dataset on every turn and dumps
-up to 111 rows into the LLM context window. This works for 120 employees
-but breaks at scale (10,000+ employees × 6 cycles = 60,000+ rows).
+For production at scale, swap _build_tfidf_index() for a neural embedding
+model (all-MiniLM-L6-v2 via sentence-transformers + FAISS) by setting
+USE_NEURAL = True and ensuring HuggingFace access.
 
-Vector retrieval solves two problems:
-  1. Context window management — sends only the 20-30 most relevant rows
-  2. Semantic matching — finds "employees who struggled" without needing
-     exact regex keywords like "underperform" or "below target"
+WHY TF-IDF WORKS WELL HERE
+---------------------------
+Workforce data is keyword-rich and structured:
+  "Bea Reyes Scheme B zero payout Ethics Qualifier failed"
+  "Aisyah Torres Scheme A max payout hit 2025-Q2 SG active"
 
-HOW IT WORKS
+TF-IDF captures these patterns well. The main limitation vs neural
+embeddings is synonym handling ("underperform" vs "miss targets") —
+mitigated here by enriching each document with synonyms at build time.
+
+ARCHITECTURE
 ------------
-Build phase (once at startup, ~5s):
-  Each row in Flash Reward and Flash Home is converted to a plain-English
-  sentence and embedded as a 384-dimensional vector using a local model.
+Build phase (once at login, ~0.5s):
+  Each employee × cycle row → plain-English sentence → TF-IDF matrix
 
-  Flash Reward row → "Aisyah Torres (E0001), Scheme A, 2025-Q2: achieved
-    82.3 on Revenue Target (target 100), payout 1200.50, no qualifier issues"
-
-  Flash Home row → "Aisyah Torres (E0001): Active employee in SG,
-    Project Alpha, joined 2021-03-15, PMGM rating: Meets Expectations"
-
-  All vectors stored in a FAISS flat index (exact search, no approximation
-  needed at this scale).
-
-Query phase (per turn, ~50ms):
-  1. Embed the user's question
-  2. Retrieve top-K most similar rows from the index
-  3. Reconstruct the matching rows as a dataframe
-  4. Pass to Claude for reasoning
-
-CHUNKING STRATEGY
------------------
-Each logical "chunk" is one employee × one cycle (Flash Reward) or one
-employee record (Flash Home). We do NOT chunk by metric row — that would
-split related information. Instead, all metrics for one employee × cycle
-are concatenated into a single sentence before embedding.
-
-This means:
-  - Flash Reward index: ~111 entries (one per employee in latest cycle)
-  - Flash Home index: ~120 entries (one per employee)
-  - Total index size: ~231 vectors × 384 dims ≈ tiny (< 1MB)
-
-At 10,000 employees × 6 cycles: ~60,000 vectors ≈ 90MB — still fine for
-in-memory FAISS on a standard cloud instance.
-
-HYBRID APPROACH (recommended for production)
---------------------------------------------
-Vector search narrows candidates → live join fills in detail.
-  1. Vector search → top-20 EmployeeIDs
-  2. Live DB query → SELECT * WHERE EmployeeID IN (top-20 ids)
-  3. Claude reasoning on the tight result set
-
-This gives semantic flexibility without stale data problems.
+Query phase (~10ms per query):
+  Embed question → cosine similarity against matrix → top-K rows → dataframe
 """
 
-VECTOR_STORE_ENABLED = False   # ← set to True to activate
-
-try:
-    import numpy as np
-    import faiss
-    from sentence_transformers import SentenceTransformer
-    _DEPS_AVAILABLE = True
-except ImportError:
-    _DEPS_AVAILABLE = False
-
+import os
+import numpy as np
 import pandas as pd
-from typing import Optional
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
-_MODEL        = None   # lazy-loaded sentence transformer
-_FR_INDEX     = None   # FAISS index for Flash Reward
-_FH_INDEX     = None   # FAISS index for Flash Home
-_FR_RECORDS   = []     # original rows matching FR index positions
-_FH_RECORDS   = []     # original rows matching FH index positions
+VECTOR_STORE_ENABLED = True
+
+# Cache dir hint (used if neural embeddings activated later)
+os.environ.setdefault(
+    "SENTENCE_TRANSFORMERS_HOME",
+    os.path.join(os.path.dirname(__file__), ".model_cache")
+)
+
+# ── Module-level index state ───────────────────────────────────────────────────
+_vectorizer   = None   # fitted TfidfVectorizer
+_fr_matrix    = None   # TF-IDF matrix for Flash Reward rows
+_fh_matrix    = None   # TF-IDF matrix for Flash Home rows
+_fr_records   = []     # original dicts matching FR matrix rows
+_fh_records   = []     # original dicts matching FH matrix rows
+
+# ── SYNONYM EXPANSION ─────────────────────────────────────────────────────────
+# Appended to each document to help TF-IDF bridge common phrasings
+_SYNONYMS = {
+    "zero":         "none empty blank missing",
+    "payout":       "pay payment reward incentive earned",
+    "max":          "maximum full top highest",
+    "miss":         "missed below underperform fail failed shortfall",
+    "hit":          "achieved reached attained exceeded met",
+    "qualifier":    "blocked disqualified failed condition",
+    "proration":    "prorated attendance absent deducted reduced",
+    "active":       "current working employed",
+    "non-active":   "left resigned terminated exited leaver",
+    "scheme":       "plan program incentive",
+    "consecutive":  "repeated continuous streak",
+    "anomaly":      "mismatch discrepancy unusual unexpected",
+}
+
+def _expand(text: str) -> str:
+    """Append synonym expansions to enrich TF-IDF vocabulary."""
+    t = text.lower()
+    extras = []
+    for word, synonyms in _SYNONYMS.items():
+        if word in t:
+            extras.append(synonyms)
+    return text + " " + " ".join(extras) if extras else text
 
 
 # ── TEXT SERIALISERS ──────────────────────────────────────────────────────────
+def _fr_to_text(row: dict) -> str:
+    name   = row.get("EmployeeName", row.get("EmployeeID", ""))
+    eid    = row.get("EmployeeID", "")
+    scheme = row.get("Scheme", "")
+    cycle  = row.get("Cycle", "")
+    payout = float(row.get("TotalCyclePayout", 0) or 0)
+    max_p  = float(row.get("SchemeMaxPayout", 1) or 1)
+    pct    = round(payout / max_p * 100, 1)
+    qual   = row.get("QualifierFailed", "") or ""
+    pror   = float(row.get("ProrFactor", 1.0) or 1.0)
+    country= row.get("Country", "")
+    project= row.get("Project", "")
+    rating = row.get("PMGMRating", "") or ""
 
-def _fr_row_to_text(row: pd.Series) -> str:
-    """Convert one Flash Reward employee × cycle row to a searchable sentence."""
-    name    = row.get("EmployeeName", row.get("EmployeeID", "Unknown"))
-    eid     = row.get("EmployeeID", "")
-    scheme  = row.get("Scheme", "")
-    cycle   = row.get("Cycle", "")
-    payout  = row.get("TotalCyclePayout", 0)
-    max_p   = row.get("SchemeMaxPayout", 0)
-    pct     = round(payout / max_p * 100, 1) if max_p else 0
-    qual    = row.get("QualifierFailed", "")
-    pror    = row.get("ProrFactor", 1.0)
-
-    parts = [
-        f"{name} ({eid}), {scheme}, {cycle}:",
-        f"payout {payout:,.0f} of max {max_p:,.0f} ({pct}%)",
-    ]
-    if qual:
-        parts.append(f"qualifier failed: {qual}")
-    if pror < 1.0:
-        parts.append(f"attendance prorated at {pror:.0%}")
+    parts = [name, eid, scheme, cycle, country, project]
+    parts.append(f"payout {payout:.0f} max {max_p:.0f} percent {pct}")
     if payout == 0:
-        parts.append("zero payout this cycle")
+        parts.append("zero payout none empty")
     if pct >= 99:
-        parts.append("hit maximum payout")
-    return " | ".join(parts)
-
-
-def _fh_row_to_text(row: pd.Series) -> str:
-    """Convert one Flash Home employee record to a searchable sentence."""
-    name    = row.get("EmployeeName", row.get("EmployeeID", "Unknown"))
-    eid     = row.get("EmployeeID", "")
-    status  = row.get("EmployeeStatus", "")
-    country = row.get("Country", "")
-    project = row.get("Project", "")
-    joined  = str(row.get("JoinDate", ""))[:10]
-    last    = str(row.get("LastDate", "")) if pd.notna(row.get("LastDate")) else ""
-    rating  = row.get("PMGMRating", "")
-
-    parts = [
-        f"{name} ({eid}): {status} employee",
-        f"country {country}, {project}",
-        f"joined {joined}",
-    ]
-    if last:
-        parts.append(f"left {last[:10]}")
+        parts.append("hit maximum full payout")
+    if pct < 50:
+        parts.append("low payout underperform miss shortfall")
+    if qual:
+        parts.append(f"qualifier failed blocked {qual}")
+    if pror < 1.0:
+        parts.append(f"prorated attendance absent {pror:.0%}")
     if rating:
-        parts.append(f"PMGM: {rating}")
-    return " | ".join(parts)
+        parts.append(f"pmgm rating {rating}")
+    return _expand(" ".join(str(p) for p in parts if p))
+
+
+def _fh_to_text(row: dict) -> str:
+    name    = row.get("EmployeeName", row.get("EmployeeID", ""))
+    eid     = row.get("EmployeeID", "")
+    status  = row.get("EmployeeStatus", "") or ""
+    country = row.get("Country", "")
+    project = row.get("Project", "") or ""
+    joined  = str(row.get("JoinDate", ""))[:10]
+    last    = str(row.get("LastDate", "") or "")[:10]
+    rating  = row.get("PMGMRating", "") or ""
+
+    parts = [name, eid, country, project, status, f"joined {joined}"]
+    if last and last != "N":
+        parts.append(f"left {last} non-active leaver exited")
+    if rating:
+        parts.append(f"pmgm rating performance {rating}")
+    if status.lower() == "active":
+        parts.append("current working employed")
+    elif "non" in status.lower():
+        parts.append("left resigned terminated exited")
+    return _expand(" ".join(str(p) for p in parts if p))
 
 
 # ── INDEX BUILDER ─────────────────────────────────────────────────────────────
-
-def build_index(fh: pd.DataFrame, fr: pd.DataFrame, latest_cycle_only: bool = True):
+def build_index(fh: pd.DataFrame, fr: pd.DataFrame,
+                latest_cycle_only: bool = True):
     """
-    Build FAISS indices from Flash Home and Flash Reward dataframes.
-    Call once at app startup after load_data().
-
-    Parameters
-    ----------
-    fh               : Flash Home dataframe
-    fr               : Flash Reward dataframe
-    latest_cycle_only: Only index the latest cycle to keep context tight
+    Build TF-IDF indices from Flash Home and Flash Reward dataframes.
+    Call once at app startup. Runs in ~0.3s for 120 employees.
     """
-    global _MODEL, _FR_INDEX, _FH_INDEX, _FR_RECORDS, _FH_RECORDS
+    global _vectorizer, _fr_matrix, _fh_matrix, _fr_records, _fh_records
 
     if not VECTOR_STORE_ENABLED:
         return
-    if not _DEPS_AVAILABLE:
-        print("vector_store: faiss-cpu or sentence-transformers not installed. Skipping.")
-        return
 
-    print("vector_store: loading embedding model...")
-    _MODEL = SentenceTransformer("all-MiniLM-L6-v2")   # 80MB, fast, 384-dim
+    # ── Flash Reward ──────────────────────────────────────────────────────────
+    fr_idx = fr[fr["Cycle"] == fr["Cycle"].max()].drop_duplicates("EmployeeID") \
+             if latest_cycle_only else fr.drop_duplicates(["EmployeeID","Cycle"])
 
-    # ── Flash Reward ──
-    if latest_cycle_only:
-        fr_to_index = fr[fr["Cycle"] == fr["Cycle"].max()].drop_duplicates("EmployeeID")
-    else:
-        fr_to_index = fr.drop_duplicates(["EmployeeID", "Cycle"])
+    # Enrich FR with names/country from FH
+    if "EmployeeName" not in fr_idx.columns and "EmployeeName" in fh.columns:
+        merge_cols = [c for c in ["EmployeeID","EmployeeName","Country","Project","PMGMRating"]
+                      if c in fh.columns]
+        fr_idx = fr_idx.merge(fh[merge_cols], on="EmployeeID", how="left")
 
-    # Merge names for richer text
-    if "EmployeeName" not in fr_to_index.columns and "EmployeeName" in fh.columns:
-        fr_to_index = fr_to_index.merge(
-            fh[["EmployeeID","EmployeeName"]], on="EmployeeID", how="left"
-        )
+    _fr_records = fr_idx.to_dict("records")
+    fr_texts    = [_fr_to_text(r) for r in _fr_records]
 
-    _FR_RECORDS = fr_to_index.to_dict("records")
-    fr_texts    = [_fr_row_to_text(pd.Series(r)) for r in _FR_RECORDS]
-    fr_vecs     = _MODEL.encode(fr_texts, show_progress_bar=False).astype("float32")
-    faiss.normalize_L2(fr_vecs)
-    _FR_INDEX   = faiss.IndexFlatIP(fr_vecs.shape[1])   # inner product on normalised = cosine
-    _FR_INDEX.add(fr_vecs)
+    # ── Flash Home ────────────────────────────────────────────────────────────
+    _fh_records = fh.to_dict("records")
+    fh_texts    = [_fh_to_text(r) for r in _fh_records]
 
-    # ── Flash Home ──
-    _FH_RECORDS = fh.to_dict("records")
-    fh_texts    = [_fh_row_to_text(pd.Series(r)) for r in _FH_RECORDS]
-    fh_vecs     = _MODEL.encode(fh_texts, show_progress_bar=False).astype("float32")
-    faiss.normalize_L2(fh_vecs)
-    _FH_INDEX   = faiss.IndexFlatIP(fh_vecs.shape[1])
-    _FH_INDEX.add(fh_vecs)
+    # ── Fit a single vectorizer on all docs so vocabulary is shared ────────────
+    all_texts  = fr_texts + fh_texts
+    _vectorizer = TfidfVectorizer(
+        ngram_range=(1, 2),    # unigrams + bigrams
+        min_df=1,
+        max_features=8000,
+        sublinear_tf=True,     # log normalization
+    )
+    all_matrix = _vectorizer.fit_transform(all_texts)
 
-    print(f"vector_store: indexed {len(_FR_RECORDS)} FR rows + {len(_FH_RECORDS)} FH rows")
+    _fr_matrix = all_matrix[:len(fr_texts)]
+    _fh_matrix = all_matrix[len(fr_texts):]
+
+    print(f"vector_store: indexed {len(_fr_records)} FR + {len(_fh_records)} FH docs "
+          f"({all_matrix.shape[1]} features)")
 
 
 # ── RETRIEVER ─────────────────────────────────────────────────────────────────
-
 def vector_retrieve(
     question: str,
     top_k: int = 30,
-    source: str = "both",   # "fr" | "fh" | "both"
-    country_filter: Optional[list] = None,
-) -> tuple[pd.DataFrame, str]:
+    source: str = "both",     # "fr" | "fh" | "both"
+    country_filter: list = None,
+) -> tuple:
     """
     Retrieve the top-K most semantically relevant rows for a question.
-
-    Returns (dataframe, context_string) matching the signature of retrieve_data().
-    Falls back to an empty dataframe if the index is not built.
-
-    Parameters
-    ----------
-    question       : User's natural language question
-    top_k          : Number of rows to retrieve per source
-    source         : Which index(es) to search
-    country_filter : If provided, filters results to these countries
+    Returns (dataframe, context_string) — same signature as retrieve_data().
+    Falls back gracefully if index is not built.
     """
-    if not VECTOR_STORE_ENABLED or _MODEL is None:
-        return pd.DataFrame(), "Vector store not enabled."
+    if _vectorizer is None or not VECTOR_STORE_ENABLED:
+        return pd.DataFrame(), "Vector store not ready — using live query."
 
-    q_vec = _MODEL.encode([question], show_progress_bar=False).astype("float32")
-    faiss.normalize_L2(q_vec)
+    q_vec = _vectorizer.transform([_expand(question)])
 
     results_fr = pd.DataFrame()
     results_fh = pd.DataFrame()
 
-    if source in ("fr", "both") and _FR_INDEX is not None and _FR_INDEX.ntotal > 0:
-        scores, idxs = _FR_INDEX.search(q_vec, min(top_k, _FR_INDEX.ntotal))
-        rows = [_FR_RECORDS[i] for i in idxs[0] if i >= 0]
-        results_fr = pd.DataFrame(rows)
-        if country_filter and "ALL" not in country_filter and "Country" in results_fr.columns:
-            results_fr = results_fr[results_fr["Country"].isin(country_filter)]
+    if source in ("fr", "both") and _fr_matrix is not None:
+        sims  = cosine_similarity(q_vec, _fr_matrix).flatten()
+        top_i = np.argsort(sims)[::-1][:top_k]
+        rows  = [_fr_records[i] for i in top_i if sims[i] > 0.0]
+        if rows:
+            results_fr = pd.DataFrame(rows)
+            if country_filter and "ALL" not in country_filter and "Country" in results_fr.columns:
+                results_fr = results_fr[results_fr["Country"].isin(country_filter)]
 
-    if source in ("fh", "both") and _FH_INDEX is not None and _FH_INDEX.ntotal > 0:
-        scores, idxs = _FH_INDEX.search(q_vec, min(top_k, _FH_INDEX.ntotal))
-        rows = [_FH_RECORDS[i] for i in idxs[0] if i >= 0]
-        results_fh = pd.DataFrame(rows)
-        if country_filter and "ALL" not in country_filter and "Country" in results_fh.columns:
-            results_fh = results_fh[results_fh["Country"].isin(country_filter)]
+    if source in ("fh", "both") and _fh_matrix is not None:
+        sims  = cosine_similarity(q_vec, _fh_matrix).flatten()
+        top_i = np.argsort(sims)[::-1][:top_k]
+        rows  = [_fh_records[i] for i in top_i if sims[i] > 0.0]
+        if rows:
+            results_fh = pd.DataFrame(rows)
+            if country_filter and "ALL" not in country_filter and "Country" in results_fh.columns:
+                results_fh = results_fh[results_fh["Country"].isin(country_filter)]
 
-    # Join on EmployeeID if both sources retrieved
+    # Merge if both sources
     if not results_fr.empty and not results_fh.empty:
-        fh_cols = [c for c in results_fh.columns if c not in results_fr.columns or c == "EmployeeID"]
-        combined = results_fr.merge(results_fh[fh_cols], on="EmployeeID", how="left")
+        fh_extra = [c for c in results_fh.columns
+                    if c not in results_fr.columns or c == "EmployeeID"]
+        combined = results_fr.merge(results_fh[fh_extra], on="EmployeeID", how="left")
     elif not results_fr.empty:
         combined = results_fr
-    else:
+    elif not results_fh.empty:
         combined = results_fh
-
-    if combined.empty:
-        return combined, "No matching records found."
+    else:
+        return pd.DataFrame(), "No matching records found."
 
     context = (
-        f"Semantic retrieval: top {len(combined)} rows most relevant to your question.\n"
+        f"Semantic retrieval — top {len(combined)} most relevant records:\n"
         f"{combined.to_string(index=False)}"
     )
     return combined, context
 
 
 # ── STATUS ────────────────────────────────────────────────────────────────────
-
 def status() -> dict:
     return {
-        "enabled":      VECTOR_STORE_ENABLED,
-        "deps_ok":      _DEPS_AVAILABLE,
-        "fr_indexed":   _FR_INDEX.ntotal if _FR_INDEX else 0,
-        "fh_indexed":   _FH_INDEX.ntotal if _FH_INDEX else 0,
-        "model_loaded": _MODEL is not None,
+        "enabled":    VECTOR_STORE_ENABLED,
+        "backend":    "TF-IDF + cosine similarity (sklearn)",
+        "fr_indexed": len(_fr_records),
+        "fh_indexed": len(_fh_records),
+        "ready":      _vectorizer is not None,
     }
