@@ -59,20 +59,22 @@ def _fmt_axes(fig):
 
 # ── INTENT CLASSIFIER ─────────────────────────────────────────────────────────
 INTENT_PATTERNS = {
-    "attainment":       r"(hit|reach|attain|max payout|maximum|full pay)",
-    "underperformance": r"(miss|under.?perform|below target|not hit|consistent)",
+    # High-specificity patterns first — must come before broad ones like attainment
+    "cross_join":       r"(who are (they|those|these|them)|show.*their name|identify them|name them|which employee|tell me who|who (is|are) (it|that|this)|give me their name)",
+    "cross_check":      r"(non.?active|inactive|left.*payout|payout.*left|leaver|exit)",
+    "country_compare":  r"(compare.*country|country.*compare|vs.*country|country.*vs|\bvs\b.*[A-Z]{2}|compare.*(sg|my|ph|th|id))",
+    "ranking":          r"(top \d+|bottom \d+|highest pay|lowest pay|best perform|worst perform|above.?average|below.?average|hit.*above|hit.*below|rank(ing)?|most paid|least paid|who earn|top perform|highest earning|lowest earning)",
+    "anomaly":          r"(anomaly|mismatch|high.*rating.*low|low.*rating.*high|pmgm.*payout|payout.*pmgm)",
     "qualifier":        r"(qualifier|blocked|fail.*qual|qual.*fail)",
     "proration":        r"(prorat|attendance|absent|proration)",
-    "anomaly":          r"(anomaly|mismatch|high.*rating.*low|low.*rating.*high|pmgm.*payout|payout.*pmgm)",
-    "cross_check":      r"(non.?active|inactive|left.*payout|payout.*left|leaver|exit)",
     "new_joiner":       r"(new joiner|first cycle|recently joined|new hire)",
-    "cross_join":       r"(who are (they|those|these|them)|show.*their name|identify them|name them|which employee|tell me who|who (is|are) (it|that|this)|give me their name)",
-    "employee_list":    r"(show.*name|list.*name|employee.*name|name.*employee|who are|all employee|employee list|staff list|roster|directory)",
-    "headcount":        r"(headcount|how many|count|active.*employee|employee.*active|workforce size)",
-    "attrition":        r"(attrition|left|resign|turnover|leavers)",
+    "underperformance": r"(miss|under.?perform|below target|not hit|consistent.*miss|consistent.*below)",
+    "attainment":       r"(hit max|reach max|attain max|max payout|hit.*maximum|% hit|pct.*hit|what %.*payout|payout.*%|% of.*payout|hit full|full payout)",
+    "employee_list":    r"(show.*name|list.*name|employee.*name|name.*employee|all employee|employee list|staff list|roster|directory)",
+    "headcount":        r"(headcount|how many employee|count.*employee|employee.*count|workforce size|number of employee)",
+    "attrition":        r"(attrition|resign|turnover|leavers)",
     "pmgm":             r"(pmgm|performance rating|rating distribution|appraisal)",
     "cycle_summary":    r"(summary|overview|this cycle|cycle summary|brief me)",
-    "country_compare":  r"(compare.*country|country.*compare|vs.*country|country.*vs|\bvs\b.*[A-Z]{2}|compare.*(sg|my|ph|th|id))",
     "free_form":        r".*",
 }
 
@@ -169,6 +171,34 @@ def retrieve_data(intent: str, countries: list, question: str):
         df     = new.merge(fr_l[["EmployeeID","Scheme","TotalCyclePayout","ProrFactor"]], on="EmployeeID", how="left")
         show_cols = [c for c in ["EmployeeID","EmployeeName","JoinDate","Country","Scheme","TotalCyclePayout","ProrFactor"] if c in df.columns]
         return df, f"New joiners (last 6 months) on incentive, scope: {scope}.\n{df[show_cols].to_string(index=False)}"
+
+    elif intent == "ranking":
+        # Payout ranking — top/bottom N, above/below average, by country
+        fr  = get_flash_reward(countries)
+        fh  = get_flash_home(countries)
+        latest = fr["Cycle"].max()
+        cyc = fr[fr["Cycle"] == latest].drop_duplicates("EmployeeID")
+        name_cols = [c for c in ["EmployeeID","EmployeeName","Country","Project","PMGMRating"]
+                     if c in fh.columns]
+        df = cyc.merge(fh[name_cols], on="EmployeeID", how="left")
+
+        # Compute payout percentage for ranking
+        df["PayoutPct"] = (df["TotalCyclePayout"] / df["SchemeMaxPayout"].replace(0,1) * 100).round(1)
+        avg_payout      = df["TotalCyclePayout"].mean()
+        df["AboveAverage"] = df["TotalCyclePayout"] > avg_payout
+
+        show = [c for c in ["EmployeeID","EmployeeName","Scheme","TotalCyclePayout",
+                             "SchemeMaxPayout","PayoutPct","QualifierFailed",
+                             "Country","Project","PMGMRating","AboveAverage"] if c in df.columns]
+        df = df[show].sort_values("TotalCyclePayout", ascending=False)
+
+        return df, (
+            f"Payout ranking for cycle {latest}, scope: {scope}.\n"
+            f"Average payout: {avg_payout:,.0f}\n"
+            f"Employees above average: {df['AboveAverage'].sum()} of {len(df)}\n"
+            f"Full ranked list (highest to lowest payout):\n"
+            f"{df.to_string(index=False)}"
+        )
 
     elif intent == "employee_list":
         fh = get_flash_home(countries)
@@ -533,15 +563,45 @@ def answer(question: str, history: list, user: dict,
         scoped_countries = [filters["country"].upper()]
 
     # ── Step 3: Retrieve data ─────────────────────────────────────────────────
-    # If router says fresh join needed OR it's a follow-up — always get full joined data
+    from vector_store import VECTOR_STORE_ENABLED, vector_retrieve, status as vs_status
+
+    # Vector retrieval is ONLY used for purely exploratory free_form questions
+    # that have no structured intent. Any question needing computation (counts,
+    # averages, rankings, aggregations) must use the live query path.
+    _ALWAYS_LIVE = {
+        "attainment", "underperformance", "qualifier", "proration",
+        "anomaly", "cross_check", "new_joiner", "ranking",
+        "cycle_summary", "country_compare", "headcount", "attrition",
+        "pmgm", "employee_list", "cross_join",
+    }
+    use_vector = (
+        VECTOR_STORE_ENABLED
+        and vs_status()["fr_indexed"] > 0
+        and not (needs_fresh or is_followup)
+        and intent not in _ALWAYS_LIVE
+        and intent == "free_form"   # only for truly unstructured exploration
+    )
+
     if needs_fresh or is_followup:
+        # Always do a live full join for follow-up / identity questions
         try:
             df, data_context = _get_followup_context(scoped_countries, last_df)
-            chart = None   # no chart for cross-source follow-ups
+            chart = None
         except Exception:
             df, data_context = retrieve_data(intent, scoped_countries, question)
             chart = build_chart(intent, df)
+
+    elif use_vector:
+        # Phase 2: semantic retrieval — top-30 most relevant rows
+        country_filter = None if "ALL" in scoped_countries else scoped_countries
+        df, data_context = vector_retrieve(
+            question, top_k=30, source="both", country_filter=country_filter
+        )
+        chart = build_chart(intent, df) if df is not None and not df.empty else None
+        data_context = f"[Semantic retrieval — top relevant records]\n{data_context}"
+
     else:
+        # Phase 1: live query (exact aggregation intents + fallback)
         df, data_context = retrieve_data(intent, scoped_countries, question)
         chart = build_chart(intent, df)
 
