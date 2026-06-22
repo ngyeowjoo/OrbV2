@@ -20,6 +20,7 @@ KNOWN_INTENTS = [
     "cross_check",      # non-active with payouts, leavers
     "new_joiner",       # first cycle, recently joined
     "cross_join",       # follow-up: identify / name employees from prior result
+    "ranking",          # top N, bottom N, above/below average payout ranking
     "employee_list",    # full employee directory with names
     "headcount",        # how many employees, count by status/country
     "attrition",        # leavers, resignations, turnover
