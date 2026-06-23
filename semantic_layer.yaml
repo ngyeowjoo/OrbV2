@@ -1,0 +1,275 @@
+# semantic_layer.yaml  —  Orb v2 Semantic Layer Configuration
+#
+# Edit this file to change business rules, synonyms, and thresholds.
+# Changes take effect on the next app reload (no code changes needed).
+#
+# Sections:
+#   synonyms    — maps user language to canonical routing terms
+#   thresholds  — named business rules used in retrieval and AI prompts
+#   field_aliases — maps user-facing terms to actual column names
+#   intent_hints  — extra phrases that force a specific intent
+
+# ── SYNONYMS ─────────────────────────────────────────────────────────────────
+# Format: canonical_term: [list of user phrases that mean the same thing]
+# The normaliser replaces any matched phrase with the canonical term
+# before routing and vector retrieval.
+
+synonyms:
+  payout:
+    - remuneration
+    - compensation
+    - incentive pay
+    - reward
+    - bonus
+    - earned amount
+    - payment
+    - incentive earned
+
+  miss:
+    - not hitting
+    - not hit
+    - failing to hit
+    - fell short
+    - below target
+    - under target
+    - underdelivered
+    - short of target
+    - didn't hit
+    - did not hit
+
+  hit:
+    - achieved
+    - reached
+    - attained
+    - met target
+    - delivered
+    - exceeded
+
+  underperformance:
+    - consistently underperforming
+    - repeated misses
+    - persistent miss
+    - chronic underperformance
+    - habitual miss
+    - long term miss
+
+  attainment:
+    - payout attainment
+    - incentive attainment
+    - target achievement
+    - goal achievement
+    - hitting targets
+
+  qualifier:
+    - disqualified
+    - blocked
+    - condition failed
+    - failed condition
+    - eligibility failed
+    - knocked out
+    - excluded from payout
+
+  proration:
+    - prorated
+    - attendance deduction
+    - absenteeism
+    - leave deduction
+    - partial pay
+    - docked pay
+    - deducted for attendance
+
+  headcount:
+    - staff count
+    - number of staff
+    - number of people
+    - workforce size
+    - team size
+    - employee count
+    - people count
+    - total staff
+
+  attrition:
+    - staff leaving
+    - people leaving
+    - resigned
+    - turnover
+    - churn
+    - departures
+    - exits
+    - employees left
+
+  pmgm:
+    - performance appraisal
+    - annual rating
+    - performance review
+    - appraisal score
+    - performance score
+    - year end rating
+    - kpi rating
+
+  anomaly:
+    - mismatch
+    - discrepancy
+    - inconsistency
+    - doesn't add up
+    - unusual
+    - unexpected
+    - outlier
+
+  active:
+    - current employee
+    - still with us
+    - currently working
+    - on headcount
+    - still employed
+
+  non_active:
+    - ex employee
+    - former employee
+    - left the company
+    - no longer with us
+    - resigned employee
+    - terminated
+    - exited
+
+  scheme:
+    - incentive plan
+    - incentive program
+    - pay plan
+    - reward plan
+    - bonus plan
+
+  cycle:
+    - quarter
+    - period
+    - incentive period
+    - review period
+    - payout period
+
+# ── THRESHOLDS ────────────────────────────────────────────────────────────────
+# Named business rules. Used in retrieve_data(), system prompt, and AI reasoning.
+# Change values here; they propagate everywhere automatically.
+
+thresholds:
+  # Underperformance
+  consecutive_miss_min: 3         # N or more consecutive cycles below target = flag
+  consecutive_miss_severe: 5      # 5+ consecutive = severe flag
+
+  # Payout / attainment
+  low_payout_pct: 50              # < 50% of SchemeMaxPayout = "low payout"
+  near_miss_pct: 5                # within 5% of max = "near miss"
+  high_attainment_pct: 90         # >= 90% of max = "high attainment"
+
+  # PMGM / performance
+  high_pmgm_bands:
+    - Exceptional
+    - Exceeds Expectations
+  low_pmgm_bands:
+    - Below Expectations
+    - Unsatisfactory
+
+  # New joiner
+  new_joiner_months: 6            # joined within last N months = new joiner
+
+  # Rankings
+  top_n_default: 10               # default N for "top N" when not specified
+  ranking_min_payout: 0           # exclude zero-payout from rankings (set to -1 to include)
+
+  # Anomaly detection
+  anomaly_high_pmgm_low_payout_pct: 50   # high PMGM + payout < this % = anomaly
+  anomaly_low_pmgm_high_payout_pct: 95   # low PMGM + payout >= this % = reverse anomaly
+
+  # Proration
+  proration_threshold: 1.0        # ProrFactor < this value = considered prorated
+
+  # Country / scope
+  global_scope_keyword: ALL       # sentinel value for global access
+
+# ── FIELD ALIASES ─────────────────────────────────────────────────────────────
+# Maps user-facing terms to actual column names in the data.
+# Used in filter extraction and display.
+
+field_aliases:
+  rating:           PMGMRating
+  performance:      PMGMRating
+  appraisal:        PMGMRating
+  earned:           TotalCyclePayout
+  payout earned:    TotalCyclePayout
+  total payout:     TotalCyclePayout
+  cap:              SchemeMaxPayout
+  scheme cap:       SchemeMaxPayout
+  maximum:          SchemeMaxPayout
+  proration factor: ProrFactor
+  attendance factor: ProrFactor
+  name:             EmployeeName
+  employee name:    EmployeeName
+  status:           EmployeeStatus
+  join date:        JoinDate
+  start date:       JoinDate
+  last date:        LastDate
+  exit date:        LastDate
+  department:       Project
+  team:             Project
+  location:         Country
+  country:          Country
+  metric:           Metric
+  target:           Target
+  achieved:         Achieved
+  qualifier:        QualifierFailed
+
+# ── INTENT HINTS ──────────────────────────────────────────────────────────────
+# Extra phrases (beyond regex) that force a specific intent.
+# Useful for phrases that are hard to capture with regex patterns.
+
+intent_hints:
+  ranking:
+    - who earns the most
+    - who gets paid the most
+    - highest earner
+    - lowest earner
+    - who are the top earners
+    - best paid
+    - worst paid
+    - above the mean
+    - below the mean
+    - above average pay
+    - below average pay
+    - sort by payout
+    - rank by payout
+    - top earner in each country
+    - top earner per country
+    - highest paid per country
+    - top performer per country
+
+  underperformance:
+    - keep missing
+    - always missing
+    - never hits
+    - never hit
+    - consistently low
+    - persistent poor performance
+    - long streak of misses
+
+  attainment:
+    - hit the cap
+    - reached the cap
+    - full incentive
+    - full reward
+    - percent of staff hitting
+    - proportion hitting max
+
+  cycle_summary:
+    - how did we do
+    - how did this cycle go
+    - what happened this cycle
+    - overall performance this cycle
+    - recap this cycle
+    - cycle performance
+
+  cross_join:
+    - tell me who they are
+    - who exactly
+    - name those employees
+    - list those people
+    - who specifically
+    - which individuals
