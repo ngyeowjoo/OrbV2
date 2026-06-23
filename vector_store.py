@@ -49,30 +49,15 @@ _fr_records   = []     # original dicts matching FR matrix rows
 _fh_records   = []     # original dicts matching FH matrix rows
 
 # ── SYNONYM EXPANSION ─────────────────────────────────────────────────────────
-# Appended to each document to help TF-IDF bridge common phrasings
-_SYNONYMS = {
-    "zero":         "none empty blank missing",
-    "payout":       "pay payment reward incentive earned",
-    "max":          "maximum full top highest",
-    "miss":         "missed below underperform fail failed shortfall",
-    "hit":          "achieved reached attained exceeded met",
-    "qualifier":    "blocked disqualified failed condition",
-    "proration":    "prorated attendance absent deducted reduced",
-    "active":       "current working employed",
-    "non-active":   "left resigned terminated exited leaver",
-    "scheme":       "plan program incentive",
-    "consecutive":  "repeated continuous streak",
-    "anomaly":      "mismatch discrepancy unusual unexpected",
-}
+# Delegated to semantic.py — editable via semantic_layer.yaml without code changes
 
 def _expand(text: str) -> str:
-    """Append synonym expansions to enrich TF-IDF vocabulary."""
-    t = text.lower()
-    extras = []
-    for word, synonyms in _SYNONYMS.items():
-        if word in t:
-            extras.append(synonyms)
-    return text + " " + " ".join(extras) if extras else text
+    """Expand text using the semantic layer synonym dictionary."""
+    try:
+        from semantic import expand_for_vector
+        return expand_for_vector(text)
+    except Exception:
+        return text   # graceful fallback if semantic layer unavailable
 
 
 # ── TEXT SERIALISERS ──────────────────────────────────────────────────────────
@@ -190,7 +175,12 @@ def vector_retrieve(
     if _vectorizer is None or not VECTOR_STORE_ENABLED:
         return pd.DataFrame(), "Vector store not ready — using live query."
 
-    q_vec = _vectorizer.transform([_expand(question)])
+    try:
+        from semantic import expand_for_vector, normalise
+        q_expanded = expand_for_vector(normalise(question))
+    except Exception:
+        q_expanded = question
+    q_vec = _vectorizer.transform([q_expanded])
 
     results_fr = pd.DataFrame()
     results_fh = pd.DataFrame()
