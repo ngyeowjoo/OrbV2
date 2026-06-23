@@ -102,9 +102,24 @@ def _regex_fallback(question: str) -> dict:
 def route(question: str, history: list, last_df_columns: list = None) -> dict:
     """
     Call DeepSeek to classify intent and data needs.
+    Normalises question with semantic layer first.
     Falls back to regex instantly on any failure.
     """
+    from semantic import normalise, hint_intent
+
+    # Apply semantic normalisation — replaces synonyms before routing
+    normalised = normalise(question)
+
+    # Check intent_hints first — these override the AI router for known phrases
+    forced_intent = hint_intent(normalised)
+
     api_key = _get_secret("DEEPSEEK_API_KEY")
+    if not api_key:
+        result = _regex_fallback(normalised)
+        if forced_intent:
+            result["intent"] = forced_intent
+            result["reasoning"] = f"Intent hint matched: '{question}' → {forced_intent}"
+        return result
     if not api_key:
         return _regex_fallback(question)
 
@@ -124,7 +139,8 @@ def route(question: str, history: list, last_df_columns: list = None) -> dict:
 {history_snippet or "(no prior messages)"}
 {last_cols_str}
 
-Current question: {question}
+Current question (normalised): {normalised}
+Original question: {question}
 
 Known intents: {", ".join(KNOWN_INTENTS)}
 
@@ -145,19 +161,21 @@ Respond with ONLY the JSON object."""
                     {"role": "user",    "content": user_prompt},
                 ],
             },
-            timeout=8,   # aggressive timeout — always fall back rather than block
+            timeout=8,
         )
         r.raise_for_status()
         raw = r.json()["choices"][0]["message"]["content"].strip()
-
-        # Strip accidental markdown fences
         raw = re.sub(r"^```[a-z]*\n?", "", raw)
         raw = re.sub(r"\n?```$", "",     raw)
         raw = raw.strip()
 
         data = json.loads(raw)
 
-        # Validate and normalise
+        # forced_intent from semantic hints overrides AI router
+        if forced_intent:
+            data["intent"] = forced_intent
+            data["reasoning"] = f"Semantic hint override: {data.get('reasoning','')}"
+
         if data.get("intent") not in KNOWN_INTENTS:
             data["intent"] = "free_form"
 
@@ -175,6 +193,10 @@ Respond with ONLY the JSON object."""
         return data
 
     except Exception as e:
-        result = _regex_fallback(question)
-        result["reasoning"] = f"Regex fallback (router error: {str(e)[:80]})"
+        result = _regex_fallback(normalised)
+        if forced_intent:
+            result["intent"] = forced_intent
+            result["reasoning"] = f"Semantic hint: {forced_intent} (router error: {str(e)[:60]})"
+        else:
+            result["reasoning"] = f"Regex fallback (router error: {str(e)[:80]})"
         return result
