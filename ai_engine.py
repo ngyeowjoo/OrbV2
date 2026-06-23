@@ -121,11 +121,13 @@ def retrieve_data(intent: str, countries: list, question: str):
         return df, f"Incentive attainment data for cycle {cycle}, scope: {scope}.\n{df.to_string(index=False)}"
 
     elif intent == "underperformance":
-        df = underperformer_summary(countries)
+        from semantic import get_threshold, normalise
+        min_cycles = get_threshold("consecutive_miss_min", 3)
+        df = underperformer_summary(countries, min_cycles=min_cycles)
         fh = get_flash_home(countries)[["EmployeeID","Country","Project"]]
         df = df.merge(fh, on="EmployeeID", how="left")
         df = _add_names(df, countries)
-        return df, f"Employees with >=3 consecutive cycles below target, scope: {scope}.\n{df.to_string(index=False)}"
+        return df, f"Employees with >={min_cycles} consecutive cycles below target, scope: {scope}.\n{df.to_string(index=False)}"
 
     elif intent == "qualifier":
         df = qualifier_summary(countries)
@@ -144,13 +146,18 @@ def retrieve_data(intent: str, countries: list, question: str):
                     f"{df[show_cols].head(40).to_string(index=False)}")
 
     elif intent == "anomaly":
+        from semantic import get_threshold
         high_low, low_high, cycle = anomaly_summary(countries)
         df = pd.concat([
             high_low.assign(AnomalyType="High PMGM / Low Payout"),
             low_high.assign(AnomalyType="Low PMGM / High Payout"),
         ])
         df = _add_names(df, countries)
-        return df, f"Performance vs payout anomaly for cycle {cycle}, scope: {scope}.\n{df.to_string(index=False)}"
+        low_pct = get_threshold("anomaly_high_pmgm_low_payout_pct", 50)
+        high_pct = get_threshold("anomaly_low_pmgm_high_payout_pct", 95)
+        return df, (f"Performance vs payout anomaly for cycle {cycle}, scope: {scope}.\n"
+                    f"High PMGM + payout < {low_pct}% of max, or Low PMGM + payout >= {high_pct}% of max.\n"
+                    f"{df.to_string(index=False)}")
 
     elif intent == "cross_check":
         joined = get_joined(countries)
@@ -174,6 +181,7 @@ def retrieve_data(intent: str, countries: list, question: str):
 
     elif intent == "ranking":
         # Payout ranking — top/bottom N, above/below average, by country
+        from semantic import get_threshold
         fr  = get_flash_reward(countries)
         fh  = get_flash_home(countries)
         latest = fr["Cycle"].max()
@@ -181,20 +189,19 @@ def retrieve_data(intent: str, countries: list, question: str):
         name_cols = [c for c in ["EmployeeID","EmployeeName","Country","Project","PMGMRating"]
                      if c in fh.columns]
         df = cyc.merge(fh[name_cols], on="EmployeeID", how="left")
-
-        # Compute payout percentage for ranking
-        df["PayoutPct"] = (df["TotalCyclePayout"] / df["SchemeMaxPayout"].replace(0,1) * 100).round(1)
-        avg_payout      = df["TotalCyclePayout"].mean()
+        df["PayoutPct"]    = (df["TotalCyclePayout"] / df["SchemeMaxPayout"].replace(0,1) * 100).round(1)
+        avg_payout         = df["TotalCyclePayout"].mean()
         df["AboveAverage"] = df["TotalCyclePayout"] > avg_payout
-
+        low_pct  = get_threshold("low_payout_pct", 50)
+        top_n    = get_threshold("top_n_default", 10)
+        df["LowPayout"] = df["PayoutPct"] < low_pct
         show = [c for c in ["EmployeeID","EmployeeName","Scheme","TotalCyclePayout",
                              "SchemeMaxPayout","PayoutPct","QualifierFailed",
-                             "Country","Project","PMGMRating","AboveAverage"] if c in df.columns]
+                             "Country","Project","PMGMRating","AboveAverage","LowPayout"] if c in df.columns]
         df = df[show].sort_values("TotalCyclePayout", ascending=False)
-
         return df, (
             f"Payout ranking for cycle {latest}, scope: {scope}.\n"
-            f"Average payout: {avg_payout:,.0f}\n"
+            f"Average payout: {avg_payout:,.0f} | Low payout threshold: <{low_pct}% of max | Default top N: {top_n}\n"
             f"Employees above average: {df['AboveAverage'].sum()} of {len(df)}\n"
             f"Full ranked list (highest to lowest payout):\n"
             f"{df.to_string(index=False)}"
@@ -539,12 +546,16 @@ def answer(question: str, history: list, user: dict,
     Uses AI router to classify intent then fetches the right data.
     """
     from router import route
+    from semantic import normalise, threshold_summary_for_prompt
 
     countries = user["countries"]
 
+    # Normalise question with semantic layer before routing
+    normalised_q = normalise(question)
+
     # ── Step 1: AI Router ────────────────────────────────────────────────────
     last_df_cols = list(last_df.columns) if last_df is not None else []
-    routing      = route(question, history, last_df_cols)
+    routing      = route(normalised_q, history, last_df_cols)
 
     intent          = routing.get("intent", "free_form")
     needs_fresh     = routing.get("needs_fresh_join", False)
@@ -621,6 +632,8 @@ def answer(question: str, history: list, user: dict,
     if chart is not None:
         chart_note = "\n- A chart has been generated alongside your response. Always provide a written summary."
 
+    threshold_rules = threshold_summary_for_prompt()
+
     system = f"""You are the Orb v2 AI assistant — an executive-grade workforce intelligence analyst.
 You are answering a {user["role"]} named {user["display_name"]}.
 Their data scope: {scope}.
@@ -628,13 +641,15 @@ Data sources: Flash Reward (Incentive System) and Flash Home (HR System).
 Today: {pd.Timestamp.today().strftime("%d %b %Y")}. Model: {model_name}.
 Query intent: {intent}. Follow-up: {is_followup}. Router: {router_reason}
 
+{threshold_rules}
+
 Rules:
 - Be concise and executive-grade. Lead with the insight.
 - Flag concerning data clearly with specific numbers.
 - When EmployeeName is in the data, refer to employees by name not ID.
   You may add ID in brackets for reference e.g. "Aisyah Torres (E0001)".
 - Do NOT use markdown bold (**) or italic (*) formatting.
-- Do NOT mention SQL, dataframes, router, or technical implementation details.
+- Do NOT mention SQL, dataframes, router, semantic layer, or technical details.
 - Always write a substantive response — never return an empty string.
 - 3-5 sentences for simple queries; plain bullet points (- item) for lists.
 - Always state the data scope and cycle period you are referencing.
