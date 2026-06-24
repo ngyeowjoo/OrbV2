@@ -9,6 +9,9 @@ Shows for every interaction:
   5. System prompt — full prompt sent to the AI
   6. AI response — raw response before clean_md()
 """
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import streamlit as st
 import json
 
