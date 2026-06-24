@@ -5,6 +5,9 @@ View and edit the semantic layer (synonyms, thresholds, field aliases,
 intent hints) without touching code. Changes are saved back to
 semantic_layer.yaml and take effect on the next query.
 """
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import streamlit as st
 import yaml
 from pathlib import Path
