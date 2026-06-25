@@ -10,6 +10,10 @@ import re
 from auth import authenticate, scope_label
 from ai_engine import answer, MODELS, MODEL_NAMES, DEFAULT_MODEL, call_model
 from chat_store import save_chat, load_all, load_chat, delete_chat, fmt_ts
+from conversation_state import get_ctx, reset_ctx, add_response_summary
+from clarifier import needs_clarification, build_clarification_message, \
+                      store_clarification_buttons, resolve_clarification, \
+                      ClarificationRequest
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PAGE CONFIG
@@ -188,6 +192,8 @@ for k, v in {
     "last_df":         None,
     "current_chat_id": None,
     "vector_index_built": False,   # tracks whether FAISS index is ready
+    "_clarification_buttons": [],  # clickable option chips for clarifier
+    "_clarification_request": None, # active ClarificationRequest object
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -374,6 +380,9 @@ def start_new_chat():
     st.session_state["panels"]          = []
     st.session_state["last_df"]         = None
     st.session_state["current_chat_id"] = None
+    st.session_state["_clarification_buttons"] = []
+    st.session_state["_clarification_request"] = None
+    reset_ctx()
     close_panel()
 
 def restore_chat(sid: str):
@@ -607,6 +616,33 @@ with chat_col:
             st.markdown('</div>', unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ── RENDER CLARIFICATION BUTTONS (from previous turn if any) ─────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+_clar_buttons = st.session_state.get("_clarification_buttons", [])
+if _clar_buttons:
+    with chat_col:
+        st.markdown(f"""
+        <div style="padding:4px 0 2px 36px;">
+          <span style="font-family:'DM Mono',monospace;font-size:0.60rem;
+                       color:{SUBTEXT};text-transform:uppercase;letter-spacing:0.08em;">
+            Select an option or type your answer</span>
+        </div>""", unsafe_allow_html=True)
+        btn_cols = st.columns(min(len(_clar_buttons), 3))
+        for bi, btn in enumerate(_clar_buttons):
+            with btn_cols[bi % len(btn_cols)]:
+                st.markdown('<div class="sug-card">', unsafe_allow_html=True)
+                if st.button(btn["label"], key=f"clar_btn_{bi}", use_container_width=True):
+                    # Treat the button value as the next user question
+                    st.session_state["_clarification_buttons"] = []
+                    st.session_state["_clarification_request"] = None
+                    st.session_state["messages"].append(
+                        {"role": "user", "content": btn["label"]}
+                    )
+                    st.session_state["_pending_question"] = btn["value"]
+                    st.rerun()
+                st.markdown('</div>', unsafe_allow_html=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ── PROCESS QUESTION ──────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 pending = st.session_state.pop("_pending_question", None) or (
@@ -615,14 +651,74 @@ pending = st.session_state.pop("_pending_question", None) or (
 
 if pending:
     q = pending.strip()
+
+    # Clear any stale clarification buttons on a new typed message
+    if not st.session_state.get("_clarification_request"):
+        st.session_state["_clarification_buttons"] = []
+
     if not any(m["content"] == q and m["role"] == "user" for m in msgs[-2:]):
         st.session_state["messages"].append({"role": "user", "content": q})
 
     history = [m for m in st.session_state["messages"][:-1]
                if m["role"] in ("user", "assistant")]
 
+    # ── Step 0: Check if this is a clarification resolution ──────────────────
+    # If the user typed something that matches a pending clarification option,
+    # resolve it to the full refined question before routing.
+    cr: ClarificationRequest = st.session_state.get("_clarification_request")
+    if cr:
+        q = resolve_clarification(q, cr)
+        st.session_state["_clarification_request"] = None
+        st.session_state["_clarification_buttons"] = []
+
+    # ── Step 1: Pre-route to check if clarification is needed ────────────────
+    # We do a lightweight route first to check ambiguity.
+    from router import route as _route
+    from semantic import normalise as _normalise
+    _pre_routing = _route(_normalise(q), history,
+                          list(st.session_state.get("last_df").columns)
+                          if st.session_state.get("last_df") is not None else [])
+    _ctx = get_ctx()
+
+    _needs_clar, _clar_request = needs_clarification(q, _pre_routing, _ctx, user)
+
+    if _needs_clar and _clar_request:
+        # Send the clarification question as Orb's response
+        clar_text = build_clarification_message(_clar_request)
+        store_clarification_buttons(_clar_request)
+        st.session_state["_clarification_request"] = _clar_request
+
+        from conversation_state import set_clarification
+        set_clarification(
+            question=_clar_request.question,
+            options=[o.label for o in _clar_request.options],
+            intent_candidates=[_pre_routing.get("intent", "free_form")],
+            clarification_type=_clar_request.clarification_type,
+        )
+
+        # Log the clarification as assistant message (no data panel)
+        st.session_state["messages"].append({"role": "assistant", "content": clar_text})
+        st.session_state["panels"].append({"chart": None, "df": None, "label": ""})
+
+        # Log to debug panel
+        try:
+            from debug_logger import log_interaction
+            log_interaction(
+                question=q, routing=_pre_routing,
+                retrieval_mode="clarification", intent=_pre_routing.get("intent",""),
+                data_context="[Clarification sent — no data fetched yet]",
+                system_prompt="[Clarification mode]", ai_response=clar_text,
+            )
+        except Exception:
+            pass
+
+        persist_current_chat()
+        st.session_state["input_key"] += 1
+        st.rerun()
+
+    # ── Step 2: Normal answer flow ────────────────────────────────────────────
     with chat_col:
-        # ── Thinking placeholder — single self-contained block ───────────────
+        # ── Thinking placeholder ─────────────────────────────────────────────
         think_box = st.empty()
         think_box.markdown(f"""
         <div style="display:flex;align-items:center;gap:10px;margin:6px 0 6px;">
@@ -633,7 +729,6 @@ if pending:
             </div>
         </div>""", unsafe_allow_html=True)
 
-        # ── Prepare answer (sync retrieval + chart build happens here) ──────
         try:
             stream, chart, df, debug_info = answer(
                 q, history, user,
@@ -641,7 +736,6 @@ if pending:
                 last_df=st.session_state.get("last_df"),
             )
 
-            # Clear the thinking placeholder, then stream the response below it
             think_box.empty()
             avatar_row = st.empty()
             avatar_row.markdown(f"""
@@ -675,6 +769,14 @@ if pending:
         text = "No data was found for your query within your permitted scope."
 
     st.session_state["messages"].append({"role": "assistant", "content": text})
+
+    # ── Update rolling response summaries for conversation context ────────────
+    try:
+        # First sentence or first 120 chars — enough for context without bloat
+        summary = text.split(".")[0][:120].strip()
+        add_response_summary(summary)
+    except Exception:
+        pass
 
     # ── Log to debug panel ────────────────────────────────────────────────────
     try:
