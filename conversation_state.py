@@ -39,7 +39,8 @@ _DEFAULTS = {
     "response_summaries":      [],   # list of str, max 6
     "last_df_columns":         [],
     "clarification_pending":   False,
-    "clarification_context":   None,  # dict: {question, options, intent_candidates}
+    "clarification_context":   None,
+    "pinned_country":          None,  # set by sidebar scope pin
 }
 
 
@@ -167,6 +168,9 @@ def ctx_for_router() -> str:
 
     if ctx["last_df_columns"]:
         lines.append(f"Last result columns: {', '.join(ctx['last_df_columns'])}")
+
+    if ctx.get("pinned_country"):
+        lines.append(f"SCOPE PIN active: user has pinned all queries to country={ctx['pinned_country']}")
 
     if ctx["response_summaries"]:
         lines.append("Recent AI responses (brief):")
