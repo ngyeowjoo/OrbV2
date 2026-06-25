@@ -542,29 +542,44 @@ def _get_followup_context(countries: list, last_df) -> tuple:
 def answer(question: str, history: list, user: dict,
            model_name: str = DEFAULT_MODEL, last_df=None):
     """
-    Returns (stream_generator, plotly_fig_or_None, dataframe_or_None)
+    Returns (stream_generator, plotly_fig_or_None, dataframe_or_None, debug_info)
     Uses AI router to classify intent then fetches the right data.
+
+    Improvements over v13c:
+      - Injects conversation_state context into system prompt
+      - Passes full history (up to 14 messages) to AI for 5+ turn coherence
+      - Updates conversation_state after each turn
+      - Router receives conversation context for smarter follow-up detection
     """
     from router import route
     from semantic import normalise, threshold_summary_for_prompt
+    from conversation_state import (
+        get_ctx, update_ctx, bump_topic, add_response_summary,
+        clear_clarification, ctx_for_ai,
+    )
 
     countries = user["countries"]
+    ctx       = get_ctx()
 
     # Normalise question with semantic layer before routing
     normalised_q = normalise(question)
 
     # ── Step 1: AI Router ────────────────────────────────────────────────────
     last_df_cols = list(last_df.columns) if last_df is not None else []
-    routing      = route(normalised_q, history, last_df_cols)
+    # Pass full last_df_cols + ctx to router (router reads ctx internally)
+    routing = route(normalised_q, history, last_df_cols)
 
-    intent          = routing.get("intent", "free_form")
-    needs_fresh     = routing.get("needs_fresh_join", False)
-    is_followup     = routing.get("is_followup", False)
-    filters         = routing.get("filters", {})
-    router_reason   = routing.get("reasoning", "")
+    intent        = routing.get("intent", "free_form")
+    needs_fresh   = routing.get("needs_fresh_join", False)
+    is_followup   = routing.get("is_followup", False)
+    filters       = routing.get("filters", {})
+    router_reason = routing.get("reasoning", "")
+
+    # If we were mid-clarification and user answered, clear it
+    if ctx.get("clarification_pending"):
+        clear_clarification()
 
     # ── Step 2: Apply router filters to country scope ────────────────────────
-    # Router can narrow country further (e.g. "show SG only" within a global user)
     scoped_countries = countries
     if filters.get("country") and "ALL" not in countries:
         rc = filters["country"].upper()
@@ -573,12 +588,17 @@ def answer(question: str, history: list, user: dict,
     elif filters.get("country") and "ALL" in countries:
         scoped_countries = [filters["country"].upper()]
 
+    # Also inherit scoped country from conversation context if router didn't set one
+    if not filters.get("country") and ctx["active_filters"].get("country"):
+        inherited = ctx["active_filters"]["country"]
+        if "ALL" not in countries and inherited in countries:
+            scoped_countries = [inherited]
+        elif "ALL" in countries:
+            scoped_countries = [inherited]
+
     # ── Step 3: Retrieve data ─────────────────────────────────────────────────
     from vector_store import VECTOR_STORE_ENABLED, vector_retrieve, status as vs_status
 
-    # Vector retrieval is ONLY used for purely exploratory free_form questions
-    # that have no structured intent. Any question needing computation (counts,
-    # averages, rankings, aggregations) must use the live query path.
     _ALWAYS_LIVE = {
         "attainment", "underperformance", "qualifier", "proration",
         "anomaly", "cross_check", "new_joiner", "ranking",
@@ -590,11 +610,10 @@ def answer(question: str, history: list, user: dict,
         and vs_status()["fr_indexed"] > 0
         and not (needs_fresh or is_followup)
         and intent not in _ALWAYS_LIVE
-        and intent == "free_form"   # only for truly unstructured exploration
+        and intent == "free_form"
     )
 
     if needs_fresh or is_followup:
-        # Always do a live full join for follow-up / identity questions
         try:
             df, data_context = _get_followup_context(scoped_countries, last_df)
             chart = None
@@ -603,7 +622,6 @@ def answer(question: str, history: list, user: dict,
             chart = build_chart(intent, df)
 
     elif use_vector:
-        # Phase 2: semantic retrieval — top-30 most relevant rows
         country_filter = None if "ALL" in scoped_countries else scoped_countries
         df, data_context = vector_retrieve(
             question, top_k=30, source="both", country_filter=country_filter
@@ -612,7 +630,6 @@ def answer(question: str, history: list, user: dict,
         data_context = f"[Semantic retrieval — top relevant records]\n{data_context}"
 
     else:
-        # Phase 1: live query (exact aggregation intents + fallback)
         df, data_context = retrieve_data(intent, scoped_countries, question)
         chart = build_chart(intent, df)
 
@@ -626,7 +643,6 @@ def answer(question: str, history: list, user: dict,
             data_context += f"\n[Filtered to status: {filters['status']}]"
 
     scope = "Global" if "ALL" in countries else ", ".join(countries)
-    cfg   = MODELS.get(model_name, MODELS[DEFAULT_MODEL])
 
     chart_note = ""
     if chart is not None:
@@ -634,18 +650,25 @@ def answer(question: str, history: list, user: dict,
 
     threshold_rules = threshold_summary_for_prompt()
 
+    # ── Conversation context block for system prompt ──────────────────────────
+    conv_context_block = ctx_for_ai()
+    conv_section = ""
+    if conv_context_block:
+        conv_section = f"\nConversation context:\n{conv_context_block}\n"
+
     system = f"""You are the Orb v2 AI assistant — an executive-grade workforce intelligence analyst.
 You are answering a {user["role"]} named {user["display_name"]}.
 Their data scope: {scope}.
 Data sources: Flash Reward (Incentive System) and Flash Home (HR System).
 Today: {pd.Timestamp.today().strftime("%d %b %Y")}. Model: {model_name}.
 Query intent: {intent}. Follow-up: {is_followup}. Router: {router_reason}
-
+{conv_section}
 {threshold_rules}
 
 Rules:
-- Be concise and executive-grade. Lead with the insight.
-- Flag concerning data clearly with specific numbers.
+- Be concise and executive-grade. Lead with the insight, not the method.
+- Quote specific numbers — never be vague when the data has them.
+- Flag concerning findings clearly with employee names and figures.
 - When EmployeeName is in the data, refer to employees by name not ID.
   You may add ID in brackets for reference e.g. "Aisyah Torres (E0001)".
 - Do NOT use markdown bold (**) or italic (*) formatting.
@@ -653,16 +676,29 @@ Rules:
 - Always write a substantive response — never return an empty string.
 - 3-5 sentences for simple queries; plain bullet points (- item) for lists.
 - Always state the data scope and cycle period you are referencing.
-- For follow-up questions: the full joined dataset is in context — use it.{chart_note}
+- For follow-up questions: the full joined dataset is in context — use it.
+- If active filters are listed in conversation context above, apply them
+  unless the user explicitly changed them in this message.{chart_note}
 
 Data context:
 {data_context}
 """
 
-    # ── Debug info package (passed back so app.py can log it) ─────────────────
+    # ── Update conversation state after building the system prompt ────────────
+    topic_summary = f"{intent} query — {question[:80]}"
+    bump_topic(
+        new_intent=intent,
+        topic_summary=topic_summary,
+        router_filters=filters,
+    )
+    update_ctx(
+        last_df_columns=list(df.columns) if df is not None else [],
+    )
+
+    # ── Debug info package ────────────────────────────────────────────────────
     retrieval_mode = (
-        "fresh_join"  if (needs_fresh or is_followup) else
-        "vector"      if use_vector else
+        "fresh_join" if (needs_fresh or is_followup) else
+        "vector"     if use_vector else
         "live_query"
     )
     debug_info = {
@@ -671,8 +707,10 @@ Data context:
         "retrieval_mode": retrieval_mode,
         "data_context":   data_context,
         "system_prompt":  system,
+        "conv_context":   conv_context_block,
     }
 
-    messages = history[-10:] + [{"role": "user", "content": question}]
+    # Pass more history to the AI — up to 14 messages for 5+ turn coherence
+    messages = history[-14:] + [{"role": "user", "content": question}]
     stream   = stream_model(messages, system, model_name)
     return stream, chart, df, debug_info
