@@ -469,6 +469,53 @@ with st.sidebar:
     st.markdown("<div style='height:1px;background:#1F2937;margin:10px 0;'></div>",
                 unsafe_allow_html=True)
 
+    # ── Scope Pin ─────────────────────────────────────────────────────────────
+    # Lets users with multi-country or global access pin a country for the session,
+    # so they don't have to re-specify it every turn.
+    user_countries = user.get("countries", [])
+    is_multi_scope = "ALL" in user_countries or len(user_countries) > 1
+
+    if is_multi_scope:
+        st.markdown(f"""
+        <p style="font-family:'Inter',sans-serif;font-size:0.65rem;font-weight:600;
+                  text-transform:uppercase;letter-spacing:0.1em;color:#4B5563;
+                  padding:0 4px 4px;">Scope Pin</p>
+        """, unsafe_allow_html=True)
+
+        if "ALL" in user_countries:
+            pin_options = ["None (Global)", "SG", "MY", "PH", "TH", "ID"]
+        else:
+            pin_options = ["None (all my countries)"] + user_countries
+
+        current_pin = get_ctx().get("pinned_country")
+        current_idx = 0
+        if current_pin and current_pin in pin_options:
+            current_idx = pin_options.index(current_pin)
+
+        selected_pin = st.selectbox(
+            "pin_scope", pin_options,
+            index=current_idx,
+            key="scope_pin_select",
+            label_visibility="collapsed",
+        )
+
+        # Update conversation context when pin changes
+        new_pin = None if selected_pin.startswith("None") else selected_pin
+        if new_pin != current_pin:
+            from conversation_state import update_ctx as _uctx
+            _uctx(pinned_country=new_pin)
+            if new_pin:
+                _uctx(active_filters={"country": new_pin})
+
+        if new_pin:
+            st.markdown(f"""
+            <div style="font-family:'DM Mono',monospace;font-size:0.62rem;
+                        color:{AMBER};padding:2px 4px 8px;">
+                ⬡ All queries scoped to {new_pin}</div>
+            """, unsafe_allow_html=True)
+        st.markdown("<div style='height:1px;background:#1F2937;margin:2px 0 10px;'></div>",
+                    unsafe_allow_html=True)
+
     st.markdown(f"""
     <div style="padding:4px 4px 8px;">
         <div style="font-family:'Inter',sans-serif;font-size:0.80rem;
@@ -600,13 +647,118 @@ with chat_col:
 
                 assistant_idx += 1
 
+    # ── Contextual quick-query chip bar (shown during active conversations) ──
+    _ctx_now   = get_ctx()
+    _topic     = _ctx_now.get("topic_intent")
+    _has_msgs  = bool(st.session_state["messages"])
+    _no_clar   = not st.session_state.get("_clarification_buttons")
+
+    # Build topic-relevant chips — 4 suggestions that are natural next steps
+    _TOPIC_CHIPS = {
+        "attainment": [
+            "Break that down by country",
+            "Who specifically hit max payout?",
+            "Show the trend across cycles",
+            "Compare by incentive scheme",
+        ],
+        "underperformance": [
+            "Who are they — show names",
+            "How long have they been missing?",
+            "Which country has the most?",
+            "Do any have active payouts?",
+        ],
+        "ranking": [
+            "Show the bottom 10 as well",
+            "Break down by country",
+            "Which scheme are the top earners on?",
+            "Who are they — show full details",
+        ],
+        "anomaly": [
+            "Show only the high-rating low-payout cases",
+            "Who are the employees involved?",
+            "How many are in each country?",
+            "Has this been flagged before?",
+        ],
+        "cycle_summary": [
+            "Who missed targets this cycle?",
+            "Show anomalies in this cycle",
+            "Compare attainment by country",
+            "Who are the top 10 earners?",
+        ],
+        "headcount": [
+            "Break that down by status",
+            "Show attrition for this group",
+            "How does this compare to last cycle?",
+            "Which country has the most leavers?",
+        ],
+        "attrition": [
+            "Show names of recent leavers",
+            "Did any leavers receive payouts?",
+            "Compare attrition by country",
+            "What was their average tenure?",
+        ],
+        "qualifier": [
+            "Who are the affected employees?",
+            "Which qualifier failed most?",
+            "How much payout was blocked?",
+            "Is this a new pattern or recurring?",
+        ],
+        "country_compare": [
+            "Drill down into the worst country",
+            "Show individual names from that group",
+            "Add PMGM rating to this comparison",
+            "Which scheme explains the gap?",
+        ],
+        "pmgm": [
+            "Who has the lowest ratings?",
+            "Compare ratings vs payout",
+            "Show rating distribution by country",
+            "Any mismatches with incentive pay?",
+        ],
+    }
+
+    if _has_msgs and _no_clar and _topic and _topic in _TOPIC_CHIPS:
+        chips = _TOPIC_CHIPS[_topic]
+        st.markdown(f"""
+        <div style="padding:6px 0 2px;">
+          <span style="font-family:'DM Mono',monospace;font-size:0.58rem;
+                       color:{SUBTEXT};text-transform:uppercase;letter-spacing:0.08em;">
+            Quick follow-ups</span>
+        </div>""", unsafe_allow_html=True)
+        chip_cols = st.columns(len(chips))
+        for ci, chip in enumerate(chips):
+            with chip_cols[ci]:
+                st.markdown('<div class="sug-card">', unsafe_allow_html=True)
+                if st.button(chip, key=f"chip_{_topic}_{ci}", use_container_width=True):
+                    st.session_state["messages"].append({"role": "user", "content": chip})
+                    st.session_state["_pending_question"] = chip
+                    st.rerun()
+                st.markdown('</div>', unsafe_allow_html=True)
+
     # ── INPUT (form — Enter submits) ─────────────────────────────────────────
-    st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+    # Placeholder is context-aware — gives examples relevant to what's been discussed
+    _placeholder_map = {
+        "attainment":       "e.g. Break that down by country…",
+        "underperformance": "e.g. Who are they — show me the names…",
+        "ranking":          "e.g. Show the bottom 10 as well…",
+        "anomaly":          "e.g. Which country has the most mismatches?",
+        "cycle_summary":    "e.g. Who missed targets this cycle?",
+        "headcount":        "e.g. Break down by status or country…",
+        "qualifier":        "e.g. How much payout was blocked in total?",
+        "pmgm":             "e.g. Compare ratings vs payout…",
+    }
+    _placeholder = (
+        _placeholder_map.get(_topic, "Ask anything about your workforce…")
+        if _has_msgs and _topic
+        else "e.g. Who missed targets 3+ cycles? or Show SG attainment this cycle…"
+    )
+
+    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
     with st.form(key="chat_form", clear_on_submit=True):
         ic, bc = st.columns([5, 1])
         with ic:
             question = st.text_input(
-                "q", placeholder="Ask anything about your workforce…",
+                "q", placeholder=_placeholder,
                 key=f"chat_input_{st.session_state['input_key']}",
                 label_visibility="collapsed",
             )
@@ -632,13 +784,14 @@ if _clar_buttons:
             with btn_cols[bi % len(btn_cols)]:
                 st.markdown('<div class="sug-card">', unsafe_allow_html=True)
                 if st.button(btn["label"], key=f"clar_btn_{bi}", use_container_width=True):
-                    # Treat the button value as the next user question
+                    # Show the full refined question in the chat bubble (not just the label)
+                    full_q = btn["value"]
                     st.session_state["_clarification_buttons"] = []
                     st.session_state["_clarification_request"] = None
                     st.session_state["messages"].append(
-                        {"role": "user", "content": btn["label"]}
+                        {"role": "user", "content": full_q}
                     )
-                    st.session_state["_pending_question"] = btn["value"]
+                    st.session_state["_pending_question"] = full_q
                     st.rerun()
                 st.markdown('</div>', unsafe_allow_html=True)
 
@@ -770,13 +923,48 @@ if pending:
 
     st.session_state["messages"].append({"role": "assistant", "content": text})
 
-    # ── Update rolling response summaries for conversation context ────────────
+    # ── Smart response summary via DeepSeek Flash ─────────────────────────────
+    # Runs async-style: fire-and-forget in a try/except so it never blocks.
+    # Produces a ~12-word key-finding summary for the conversation context tracker.
     try:
-        # First sentence or first 120 chars — enough for context without bloat
-        summary = text.split(".")[0][:120].strip()
-        add_response_summary(summary)
+        import threading
+
+        def _summarise(response_text, intent):
+            try:
+                summary_msgs = [{
+                    "role": "user",
+                    "content": (
+                        f"Summarise this workforce analytics response in exactly 12 words or fewer, "
+                        f"capturing only the single most important finding. "
+                        f"Plain text only, no punctuation at the end.\n\n{response_text[:800]}"
+                    )
+                }]
+                summary_system = (
+                    "You produce ultra-concise 12-word summaries of data findings. "
+                    "Output only the summary, nothing else."
+                )
+                summary = call_model(summary_msgs, summary_system,
+                                     st.session_state.get("selected_model", DEFAULT_MODEL))
+                summary = summary.strip()[:140]
+                add_response_summary(f"[{intent}] {summary}")
+            except Exception:
+                # Fallback to first sentence if the call fails
+                fallback = response_text.split(".")[0][:120].strip()
+                if fallback:
+                    add_response_summary(fallback)
+
+        t = threading.Thread(
+            target=_summarise,
+            args=(text, debug_info.get("intent", "unknown")),
+            daemon=True,
+        )
+        t.start()
     except Exception:
-        pass
+        # Last-resort fallback
+        try:
+            add_response_summary(text.split(".")[0][:120].strip())
+        except Exception:
+            pass
 
     # ── Log to debug panel ────────────────────────────────────────────────────
     try:
@@ -789,6 +977,7 @@ if pending:
             data_context   = debug_info.get("data_context", ""),
             system_prompt  = debug_info.get("system_prompt", ""),
             ai_response    = text,
+            max_tokens     = debug_info.get("max_tokens"),
         )
     except Exception:
         pass   # never crash the main app over debug logging
