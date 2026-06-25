@@ -3,13 +3,20 @@ router.py  —  AI-powered intent router for Orb v2
 
 Uses DeepSeek V4 Flash (fast, cheap) as the routing model.
 Falls back to regex detection if the call fails.
+
+Improvements over v13c:
+  - Few-shot disambiguation examples for the 6 hardest intent pairs
+  - Injects conversation_state context so history > 4 turns is handled
+  - Passes last 6 messages (up from 4) to the router
+  - Smarter is_followup detection using pronoun + context continuity
+  - Regex fallback also uses conversation context
 """
 import json, os, re
 import requests
 import streamlit as st
 
-DEEPSEEK_API_URL   = "https://api.deepseek.com/chat/completions"
-ROUTER_MODEL       = "deepseek-v4-flash"   # cheapest/fastest for routing
+DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
+ROUTER_MODEL     = "deepseek-v4-flash"
 
 KNOWN_INTENTS = [
     "attainment",       # % hitting max payout, payout achievement
@@ -30,7 +37,7 @@ KNOWN_INTENTS = [
     "free_form",        # anything else / complex multi-part
 ]
 
-ROUTER_SYSTEM = """You are a data routing assistant for a workforce analytics platform.
+ROUTER_SYSTEM = """You are a data routing assistant for a workforce analytics platform called Orb.
 Your ONLY job is to classify the user question and decide what data retrieval is needed.
 
 Available data:
@@ -65,8 +72,45 @@ Set needs_fresh_join = true when:
 - Prior result columns lack either payout or employee names
 - Question is a follow-up needing data not visible in the previous result
 
-Set is_followup = true when question references prior context using words like:
-they, those, these, them, same, among, of those, of them, their, those employees, the above"""
+Set is_followup = true when:
+- Question references prior context using words like: they, those, these, them, same,
+  among, of those, of them, their, those employees, the above, that group, those people
+- The conversation context shows a topic has been established and this is a drill-down
+- The question is too short to stand alone without prior context (e.g. "what about SG?",
+  "and the bottom 10?", "break that down by country")
+
+=== DISAMBIGUATION EXAMPLES (hard cases) ===
+
+Q: "who earns the most?" — intent: ranking (not employee_list — user wants sorted by payout)
+Q: "list all employees" — intent: employee_list (not ranking — user wants a directory)
+Q: "show me attainment" — intent: attainment (not ranking — user wants % hitting max, not a leaderboard)
+Q: "who hit max payout?" — intent: attainment (about hitting the cap, not who earns most)
+Q: "top 10 by payout" — intent: ranking (explicit N + sort = ranking)
+Q: "who are the underperformers?" — intent: underperformance (not ranking — about consecutive misses)
+
+Q: "who are they?" (after underperformance result) — intent: cross_join, is_followup: true
+Q: "name those employees" (after any result) — intent: cross_join, is_followup: true
+Q: "show me in SG" (after headcount result) — same intent as prior, is_followup: true, filter country: SG
+Q: "break that down by country" — same intent as prior, is_followup: true
+Q: "what about the ones who left?" — intent: cross_check, is_followup: true
+
+Q: "compare countries" — intent: country_compare (not headcount — user wants a comparison table)
+Q: "how many in each country?" — intent: headcount (count, not comparison metric)
+Q: "attrition vs headcount" — intent: country_compare (comparing two metrics)
+Q: "who resigned?" — intent: attrition (not cross_check — no payout concern mentioned)
+Q: "non-active with payouts" — intent: cross_check (specific: leavers who still received pay)
+
+Q: "anomaly" / "anything unusual?" — intent: anomaly (needs PMGM vs payout check)
+Q: "mismatch in ratings and pay" — intent: anomaly
+Q: "who got paid despite bad ratings?" — intent: anomaly, filter needs_fresh_join: true
+Q: "are there any errors in the data?" — intent: anomaly (interpret as data quality check)
+
+Q: "qualifier" / "who's blocked?" — intent: qualifier
+Q: "why did someone not get paid?" — intent: qualifier (most likely reason is qualifier failure)
+Q: "attendance issues?" — intent: proration
+Q: "partial payout" — intent: proration (attendance deduction)
+
+=== END DISAMBIGUATION EXAMPLES ==="""
 
 
 def _get_secret(key: str) -> str:
@@ -76,38 +120,56 @@ def _get_secret(key: str) -> str:
         return os.environ.get(key, "")
 
 
-def _regex_fallback(question: str) -> dict:
-    """Pure-regex fallback — same output schema as the AI router."""
+def _regex_fallback(question: str, ctx: dict = None) -> dict:
+    """Pure-regex fallback — same output schema as the AI router.
+    Uses conversation context to improve follow-up detection."""
     from ai_engine import detect_intent
-    intent      = detect_intent(question)
-    q           = question.lower()
-    is_followup = bool(re.search(
-        r"\b(they|those|these|them|same|among|of those|of them|their|those employees)\b", q
-    ))
+    intent = detect_intent(question)
+    q      = question.lower()
+
+    # Enhanced follow-up detection — also checks conversation context
+    followup_patterns = r"\b(they|those|these|them|same|among|of those|of them|their|" \
+                        r"those employees|the above|that group|those people|" \
+                        r"break that|break it|drill down|zoom in|and the|what about)\b"
+    is_followup = bool(re.search(followup_patterns, q))
+
+    # Short question in an active conversation is likely a follow-up
+    if not is_followup and ctx and ctx.get("topic_intent") and len(question.split()) <= 4:
+        is_followup = True
+
     needs_fresh = is_followup or intent in ("cross_join", "free_form")
+
+    # Inherit active filters from conversation context
+    filters = {
+        "country": None, "scheme": None, "cycle": None,
+        "threshold": None, "employee_id": None, "status": None,
+    }
+    if ctx and ctx.get("active_filters"):
+        for k, v in ctx["active_filters"].items():
+            if v is not None and k in filters:
+                filters[k] = v
+
     return {
         "intent":             intent,
         "needs_fresh_join":   needs_fresh,
         "needs_flash_reward": intent not in ("employee_list", "headcount", "attrition", "pmgm"),
         "needs_flash_home":   intent not in ("attainment", "qualifier", "proration", "cycle_summary"),
         "is_followup":        is_followup,
-        "filters": {
-            "country": None, "scheme": None, "cycle": None,
-            "threshold": None, "employee_id": None, "status": None,
-        },
-        "reasoning": "Regex fallback — DeepSeek router unavailable.",
+        "filters":            filters,
+        "reasoning":          "Regex fallback — DeepSeek router unavailable.",
     }
 
 
 def route(question: str, history: list, last_df_columns: list = None) -> dict:
     """
     Call DeepSeek to classify intent and data needs.
-    Normalises question with semantic layer first.
-    Falls back to regex instantly on any failure.
+    Injects conversation_state context for multi-turn coherence.
+    Falls back to regex on any failure.
     """
     from semantic import normalise, hint_intent
+    from conversation_state import get_ctx, ctx_for_router
 
-    # Apply semantic normalisation — replaces synonyms before routing
+    ctx        = get_ctx()
     normalised = normalise(question)
 
     # Check intent_hints first — these override the AI router for known phrases
@@ -115,32 +177,37 @@ def route(question: str, history: list, last_df_columns: list = None) -> dict:
 
     api_key = _get_secret("DEEPSEEK_API_KEY")
     if not api_key:
-        result = _regex_fallback(normalised)
+        result = _regex_fallback(normalised, ctx)
         if forced_intent:
-            result["intent"] = forced_intent
+            result["intent"]    = forced_intent
             result["reasoning"] = f"Intent hint matched: '{question}' → {forced_intent}"
         return result
-    if not api_key:
-        return _regex_fallback(question)
 
-    # Compact conversation context
+    # ── Build conversation snippet (last 6 messages, not 4) ──────────────────
     history_snippet = ""
     if history:
-        recent = history[-4:]
+        recent = history[-6:]
         history_snippet = "\n".join(
-            f"{m['role'].upper()}: {m['content'][:120]}" for m in recent
+            f"{m['role'].upper()}: {m['content'][:150]}" for m in recent
         )
 
     last_cols_str = ""
     if last_df_columns:
         last_cols_str = f"\nPrevious result columns: {', '.join(last_df_columns)}"
 
-    user_prompt = f"""Conversation so far:
+    # ── Inject conversation context ───────────────────────────────────────────
+    conv_context = ctx_for_router()
+
+    user_prompt = f"""=== CONVERSATION CONTEXT ===
+{conv_context}
+
+=== RECENT MESSAGES ===
 {history_snippet or "(no prior messages)"}
 {last_cols_str}
 
-Current question (normalised): {normalised}
-Original question: {question}
+=== CURRENT QUESTION ===
+Normalised: {normalised}
+Original:   {question}
 
 Known intents: {", ".join(KNOWN_INTENTS)}
 
@@ -155,47 +222,53 @@ Respond with ONLY the JSON object."""
             },
             json={
                 "model":      ROUTER_MODEL,
-                "max_tokens": 300,
+                "max_tokens": 350,
                 "messages": [
-                    {"role": "system",  "content": ROUTER_SYSTEM},
-                    {"role": "user",    "content": user_prompt},
+                    {"role": "system", "content": ROUTER_SYSTEM},
+                    {"role": "user",   "content": user_prompt},
                 ],
             },
-            timeout=8,
+            timeout=10,
         )
         r.raise_for_status()
         raw = r.json()["choices"][0]["message"]["content"].strip()
         raw = re.sub(r"^```[a-z]*\n?", "", raw)
-        raw = re.sub(r"\n?```$", "",     raw)
+        raw = re.sub(r"\n?```$",       "", raw)
         raw = raw.strip()
 
         data = json.loads(raw)
 
         # forced_intent from semantic hints overrides AI router
         if forced_intent:
-            data["intent"] = forced_intent
-            data["reasoning"] = f"Semantic hint override: {data.get('reasoning','')}"
+            data["intent"]    = forced_intent
+            data["reasoning"] = f"Semantic hint override: {data.get('reasoning', '')}"
 
         if data.get("intent") not in KNOWN_INTENTS:
             data["intent"] = "free_form"
+
+        # Inherit active filters from conversation context for follow-ups
+        if data.get("is_followup") and ctx.get("active_filters"):
+            for k, v in ctx["active_filters"].items():
+                if v is not None:
+                    data["filters"].setdefault(k, None)
+                    if data["filters"].get(k) is None:
+                        data["filters"][k] = v
 
         data.setdefault("needs_fresh_join",   False)
         data.setdefault("needs_flash_reward", True)
         data.setdefault("needs_flash_home",   False)
         data.setdefault("is_followup",        False)
-        data.setdefault("filters", {
-            "country": None, "scheme": None, "cycle": None,
-            "threshold": None, "employee_id": None, "status": None,
-        })
-        for k in ["country","scheme","cycle","threshold","employee_id","status"]:
+        data.setdefault("filters", {})
+        for k in ["country", "scheme", "cycle", "threshold", "employee_id", "status"]:
             data["filters"].setdefault(k, None)
         data.setdefault("reasoning", "")
+
         return data
 
     except Exception as e:
-        result = _regex_fallback(normalised)
+        result = _regex_fallback(normalised, ctx)
         if forced_intent:
-            result["intent"] = forced_intent
+            result["intent"]    = forced_intent
             result["reasoning"] = f"Semantic hint: {forced_intent} (router error: {str(e)[:60]})"
         else:
             result["reasoning"] = f"Regex fallback (router error: {str(e)[:80]})"
