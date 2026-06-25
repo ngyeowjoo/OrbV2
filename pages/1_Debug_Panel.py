@@ -8,6 +8,7 @@ import streamlit as st
 import json
 from debug_logger import get_log, clear_log
 from vector_store import status as vs_status, VECTOR_STORE_ENABLED
+from conversation_state import get_ctx
 
 st.set_page_config(
     page_title="Orb v2 — Debug Panel",
@@ -115,6 +116,39 @@ with st.expander("Vector Store Status", expanded=False):
         except Exception as e:
             st.info(f"Index not yet built this session: {e}")
 
+# ── Conversation State ─────────────────────────────────────────────────────
+with st.expander("Conversation State (current session)", expanded=False):
+    try:
+        ctx = get_ctx()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Topic Intent",    ctx.get("topic_intent") or "—")
+        c2.metric("Turns on Topic",  ctx.get("turns_in_topic", 0))
+        c3.metric("Clarif. Pending", "Yes" if ctx.get("clarification_pending") else "No")
+
+        active = {k: v for k, v in ctx.get("active_filters", {}).items() if v is not None}
+        if active:
+            st.markdown(f'<p style="font-family:DM Mono,monospace;font-size:0.68rem;'
+                        f'text-transform:uppercase;color:{SUBTEXT};margin:12px 0 4px;">Active Filters</p>',
+                        unsafe_allow_html=True)
+            st.json(active)
+
+        summaries = ctx.get("response_summaries", [])
+        if summaries:
+            st.markdown(f'<p style="font-family:DM Mono,monospace;font-size:0.68rem;'
+                        f'text-transform:uppercase;color:{SUBTEXT};margin:12px 0 4px;">'
+                        f'Response Summaries (last {len(summaries)})</p>', unsafe_allow_html=True)
+            for s in summaries:
+                st.markdown(f'<div style="font-family:Inter,sans-serif;font-size:0.80rem;'
+                            f'color:{TEXT};padding:3px 0;">• {s}</div>', unsafe_allow_html=True)
+
+        if ctx.get("clarification_context"):
+            st.markdown(f'<p style="font-family:DM Mono,monospace;font-size:0.68rem;'
+                        f'text-transform:uppercase;color:{SUBTEXT};margin:12px 0 4px;">'
+                        f'Clarification Context</p>', unsafe_allow_html=True)
+            st.json(ctx["clarification_context"])
+    except Exception as e:
+        st.info(f"Conversation state not available: {e}")
+
 st.markdown(f"<div style='height:1px;background:{BORDER};margin:16px 0;'></div>",
             unsafe_allow_html=True)
 
@@ -157,7 +191,7 @@ else:
             </div>
             """, unsafe_allow_html=True)
 
-            tabs = st.tabs(["Router", "Data Context", "System Prompt", "AI Response"])
+            tabs = st.tabs(["Router", "Conv Context", "Data Context", "System Prompt", "AI Response"])
 
             with tabs[0]:
                 col_a, col_b = st.columns(2)
@@ -183,6 +217,14 @@ else:
                 </div>""", unsafe_allow_html=True)
 
             with tabs[1]:
+                conv_ctx = entry.get("conv_context") or entry.get("routing", {}).get("reasoning", "")
+                if conv_ctx:
+                    st.caption("Conversation context injected into this turn")
+                    st.code(conv_ctx, language=None)
+                else:
+                    st.caption("No conversation context for this entry (first turn or unavailable)")
+
+            with tabs[2]:
                 ctx   = entry.get("data_context", "")
                 lines = ctx.split("\n")
                 st.caption(f"Data sent to AI — {len(lines)} lines, {len(ctx):,} chars")
@@ -191,7 +233,7 @@ else:
                     preview += f"\n\n... ({len(lines)-100} more lines truncated)"
                 st.code(preview, language=None)
 
-            with tabs[2]:
+            with tabs[3]:
                 prompt = entry.get("system_prompt", "")
                 st.caption(f"Full system prompt — {len(prompt):,} chars")
                 if "Data context:" in prompt:
@@ -208,7 +250,7 @@ else:
                 else:
                     st.code(prompt[:3000], language=None)
 
-            with tabs[3]:
+            with tabs[4]:
                 response = entry.get("ai_response", "")
                 st.caption(f"Raw AI response — {len(response):,} chars")
                 st.markdown(f"""
