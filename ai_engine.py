@@ -390,7 +390,33 @@ def _get_secret(key: str) -> str:
         return os.environ.get(key, "")
 
 # ── STREAMING API CALLERS ─────────────────────────────────────────────────────
-def stream_anthropic(messages: list, system: str, model_id: str):
+# ── PER-INTENT TOKEN BUDGETS ──────────────────────────────────────────────────
+# Intents that produce long structured output get more tokens.
+# All others default to 1200 (more than the old 1024 for breathing room).
+INTENT_MAX_TOKENS = {
+    "cycle_summary":    2000,
+    "ranking":          1800,
+    "country_compare":  1600,
+    "underperformance": 1600,
+    "employee_list":    1600,
+    "cross_join":       1600,
+    "anomaly":          1500,
+    "attainment":       1400,
+    "qualifier":        1400,
+    "proration":        1400,
+    "cross_check":      1400,
+    "new_joiner":       1400,
+    "free_form":        1400,
+    # lighter intents
+    "headcount":        1200,
+    "attrition":        1200,
+    "pmgm":             1200,
+}
+DEFAULT_MAX_TOKENS = 1200
+
+
+def stream_anthropic(messages: list, system: str, model_id: str,
+                     max_tokens: int = DEFAULT_MAX_TOKENS):
     """Yields text chunks from Anthropic streaming API."""
     api_key = _get_secret("ANTHROPIC_API_KEY")
     with requests.post(
@@ -402,7 +428,7 @@ def stream_anthropic(messages: list, system: str, model_id: str):
         },
         json={
             "model":      model_id,
-            "max_tokens": 1024,
+            "max_tokens": max_tokens,
             "system":     system,
             "messages":   messages,
             "stream":     True,
@@ -430,7 +456,8 @@ def stream_anthropic(messages: list, system: str, model_id: str):
                     continue
 
 
-def stream_deepseek(messages: list, system: str, model_id: str):
+def stream_deepseek(messages: list, system: str, model_id: str,
+                    max_tokens: int = DEFAULT_MAX_TOKENS):
     """Yields text chunks from DeepSeek streaming API (OpenAI-compatible)."""
     import json
     api_key = _get_secret("DEEPSEEK_API_KEY")
@@ -443,7 +470,7 @@ def stream_deepseek(messages: list, system: str, model_id: str):
         },
         json={
             "model":      model_id,
-            "max_tokens": 1024,
+            "max_tokens": max_tokens,
             "messages":   openai_messages,
             "stream":     True,
         },
@@ -469,15 +496,16 @@ def stream_deepseek(messages: list, system: str, model_id: str):
                     continue
 
 
-def stream_model(messages: list, system: str, model_name: str):
+def stream_model(messages: list, system: str, model_name: str,
+                 max_tokens: int = DEFAULT_MAX_TOKENS):
     """Dispatches to the correct streaming provider."""
     cfg      = MODELS.get(model_name, MODELS[DEFAULT_MODEL])
     provider = cfg["provider"]
     model_id = cfg["model_id"]
     if provider == "anthropic":
-        yield from stream_anthropic(messages, system, model_id)
+        yield from stream_anthropic(messages, system, model_id, max_tokens)
     elif provider == "deepseek":
-        yield from stream_deepseek(messages, system, model_id)
+        yield from stream_deepseek(messages, system, model_id, max_tokens)
 
 
 # ── FALLBACK: non-streaming call ──────────────────────────────────────────────
@@ -511,7 +539,7 @@ def call_model(messages, system, model_name):
 def _get_followup_context(countries: list, last_df) -> tuple:
     """
     For follow-up questions, build a rich joined context from Flash Reward + Flash Home.
-    Always returns a fully joined df so the AI can answer identity questions.
+    Caps at 150 rows sorted by TotalCyclePayout to avoid context-window overflow.
     """
     from data import get_flash_reward, get_flash_home
     fr  = get_flash_reward(countries)
@@ -526,8 +554,21 @@ def _get_followup_context(countries: list, last_df) -> tuple:
                          "Country","Project","PMGMRating","EmployeeStatus"] if c in joined.columns]
     joined = joined[show]
 
-    parts = [f"Latest cycle: {latest}. Full employee payout + HR joined data:"]
-    parts.append(joined.to_string(index=False))
+    total_rows = len(joined)
+    ROW_CAP    = 150
+    if "TotalCyclePayout" in joined.columns:
+        joined_display = joined.sort_values("TotalCyclePayout", ascending=False).head(ROW_CAP)
+    else:
+        joined_display = joined.head(ROW_CAP)
+
+    cap_note = ""
+    if total_rows > ROW_CAP:
+        cap_note = (f"\n[Note: {total_rows} employees total — showing top {ROW_CAP} by payout. "
+                    f"If asked about a specific employee not shown, state this limitation.]")
+
+    parts = [f"Latest cycle: {latest}. Joined employee payout + HR data "
+             f"({min(total_rows, ROW_CAP)} of {total_rows} employees shown):{cap_note}"]
+    parts.append(joined_display.to_string(index=False))
 
     if last_df is not None:
         try:
@@ -543,13 +584,14 @@ def answer(question: str, history: list, user: dict,
            model_name: str = DEFAULT_MODEL, last_df=None):
     """
     Returns (stream_generator, plotly_fig_or_None, dataframe_or_None, debug_info)
-    Uses AI router to classify intent then fetches the right data.
 
-    Improvements over v13c:
-      - Injects conversation_state context into system prompt
-      - Passes full history (up to 14 messages) to AI for 5+ turn coherence
-      - Updates conversation_state after each turn
-      - Router receives conversation context for smarter follow-up detection
+    Improvements:
+      - Role-aware system prompt (CEO vs HR Admin vs Country Head)
+      - Intent-based max_tokens — no more silent truncation
+      - free_form triggers cycle_summary + anomaly double-fetch
+      - followup context capped at 150 rows
+      - Empty-data instruction so AI suggests alternatives
+      - Conversation context injected for 5+ turn coherence
     """
     from router import route
     from semantic import normalise, threshold_summary_for_prompt
@@ -561,12 +603,10 @@ def answer(question: str, history: list, user: dict,
     countries = user["countries"]
     ctx       = get_ctx()
 
-    # Normalise question with semantic layer before routing
     normalised_q = normalise(question)
 
     # ── Step 1: AI Router ────────────────────────────────────────────────────
     last_df_cols = list(last_df.columns) if last_df is not None else []
-    # Pass full last_df_cols + ctx to router (router reads ctx internally)
     routing = route(normalised_q, history, last_df_cols)
 
     intent        = routing.get("intent", "free_form")
@@ -575,11 +615,10 @@ def answer(question: str, history: list, user: dict,
     filters       = routing.get("filters", {})
     router_reason = routing.get("reasoning", "")
 
-    # If we were mid-clarification and user answered, clear it
     if ctx.get("clarification_pending"):
         clear_clarification()
 
-    # ── Step 2: Apply router filters to country scope ────────────────────────
+    # ── Step 2: Country scope ─────────────────────────────────────────────────
     scoped_countries = countries
     if filters.get("country") and "ALL" not in countries:
         rc = filters["country"].upper()
@@ -588,8 +627,12 @@ def answer(question: str, history: list, user: dict,
     elif filters.get("country") and "ALL" in countries:
         scoped_countries = [filters["country"].upper()]
 
-    # Also inherit scoped country from conversation context if router didn't set one
-    if not filters.get("country") and ctx["active_filters"].get("country"):
+    # Inherit scoped country from pinned scope or conversation context
+    pinned = ctx.get("pinned_country")
+    if pinned and not filters.get("country"):
+        if "ALL" in countries or pinned in countries:
+            scoped_countries = [pinned]
+    elif not filters.get("country") and ctx["active_filters"].get("country"):
         inherited = ctx["active_filters"]["country"]
         if "ALL" not in countries and inherited in countries:
             scoped_countries = [inherited]
@@ -621,6 +664,22 @@ def answer(question: str, history: list, user: dict,
             df, data_context = retrieve_data(intent, scoped_countries, question)
             chart = build_chart(intent, df)
 
+    elif intent == "free_form" and not use_vector:
+        # Double-fetch: cycle_summary + anomaly gives the AI real numbers
+        # to work with instead of guessing from 10 sample rows.
+        try:
+            df_sum,  ctx_sum  = retrieve_data("cycle_summary", scoped_countries, question)
+            df_anom, ctx_anom = retrieve_data("anomaly",       scoped_countries, question)
+            df = df_sum
+            data_context = (
+                "[Free-form — combined cycle summary + anomaly context]\n"
+                f"{ctx_sum}\n\n--- Anomaly Data ---\n{ctx_anom}"
+            )
+            chart = build_chart("cycle_summary", df_sum)
+        except Exception:
+            df, data_context = retrieve_data("free_form", scoped_countries, question)
+            chart = None
+
     elif use_vector:
         country_filter = None if "ALL" in scoped_countries else scoped_countries
         df, data_context = vector_retrieve(
@@ -633,7 +692,7 @@ def answer(question: str, history: list, user: dict,
         df, data_context = retrieve_data(intent, scoped_countries, question)
         chart = build_chart(intent, df)
 
-    # Apply scheme / status filter from router if dataframe supports it
+    # Apply scheme / status filter
     if df is not None and not df.empty:
         if filters.get("scheme") and "Scheme" in df.columns:
             df = df[df["Scheme"].str.lower() == filters["scheme"].lower()]
@@ -643,21 +702,60 @@ def answer(question: str, history: list, user: dict,
             data_context += f"\n[Filtered to status: {filters['status']}]"
 
     scope = "Global" if "ALL" in countries else ", ".join(countries)
+    if scoped_countries != countries and "ALL" not in scoped_countries:
+        scope = ", ".join(scoped_countries) + " (scoped)"
+
+    # ── Role-aware response calibration ──────────────────────────────────────
+    role = user.get("role", "")
+    _EXEC_ROLES    = {"CEO", "COO", "COO — APAC"}
+    _COUNTRY_ROLES = {"Country Head — SG", "Country Head — MY", "Country Head"}
+    _HR_ROLES      = {"HR Admin"}
+
+    if any(r in role for r in ["CEO", "COO"]):
+        role_instruction = (
+            "You are briefing a C-suite executive. Lead with the single most important "
+            "finding in the first sentence. Give 2-3 specific numbers. Flag the top 1-2 "
+            "concerns by name. Do not list every employee — synthesise."
+        )
+        list_depth = "Top 5 items max for lists unless the user asked for more."
+    elif "Country Head" in role:
+        role_instruction = (
+            "You are briefing a Country Head who knows their team personally. "
+            "Use employee names freely. Give full breakdowns for their country. "
+            "Flag every individual concern — they want to act on specifics."
+        )
+        list_depth = "Show all flagged employees — do not cap the list."
+    elif "HR" in role:
+        role_instruction = (
+            "You are briefing an HR Administrator who needs operational detail. "
+            "Include employee IDs alongside names. Show full lists, not summaries. "
+            "Be precise about dates, cycle references, and scheme names."
+        )
+        list_depth = "Show complete data — no truncation."
+    else:
+        role_instruction = "Be concise and lead with the insight."
+        list_depth = "3-5 bullet points for lists unless asked for more."
+
+    # ── Empty data instruction ────────────────────────────────────────────────
+    empty_note = ""
+    if df is None or (hasattr(df, "empty") and df.empty):
+        empty_note = (
+            "\n- The data returned is EMPTY. State this clearly. "
+            "Then suggest 1-2 alternative questions the user could try "
+            "(e.g. a related intent or a broader scope). "
+            "Do not fabricate data or say 'no concerns found' without confirming the data is present."
+        )
 
     chart_note = ""
     if chart is not None:
-        chart_note = "\n- A chart has been generated alongside your response. Always provide a written summary."
+        chart_note = "\n- A chart has been generated. Always provide a written summary alongside it."
 
     threshold_rules = threshold_summary_for_prompt()
-
-    # ── Conversation context block for system prompt ──────────────────────────
     conv_context_block = ctx_for_ai()
-    conv_section = ""
-    if conv_context_block:
-        conv_section = f"\nConversation context:\n{conv_context_block}\n"
+    conv_section = f"\nConversation context:\n{conv_context_block}\n" if conv_context_block else ""
 
     system = f"""You are the Orb v2 AI assistant — an executive-grade workforce intelligence analyst.
-You are answering a {user["role"]} named {user["display_name"]}.
+You are answering a {role} named {user["display_name"]}.
 Their data scope: {scope}.
 Data sources: Flash Reward (Incentive System) and Flash Home (HR System).
 Today: {pd.Timestamp.today().strftime("%d %b %Y")}. Model: {model_name}.
@@ -665,37 +763,34 @@ Query intent: {intent}. Follow-up: {is_followup}. Router: {router_reason}
 {conv_section}
 {threshold_rules}
 
+Response style for this user:
+{role_instruction}
+{list_depth}
+
 Rules:
-- Be concise and executive-grade. Lead with the insight, not the method.
+- Lead with the insight, not the method. Never open with "Based on the data..."
 - Quote specific numbers — never be vague when the data has them.
-- Flag concerning findings clearly with employee names and figures.
 - When EmployeeName is in the data, refer to employees by name not ID.
-  You may add ID in brackets for reference e.g. "Aisyah Torres (E0001)".
+  Add ID in brackets only when the user is HR: "Aisyah Torres (E0001)".
 - Do NOT use markdown bold (**) or italic (*) formatting.
 - Do NOT mention SQL, dataframes, router, semantic layer, or technical details.
-- Always write a substantive response — never return an empty string.
-- 3-5 sentences for simple queries; plain bullet points (- item) for lists.
 - Always state the data scope and cycle period you are referencing.
-- For follow-up questions: the full joined dataset is in context — use it.
-- If active filters are listed in conversation context above, apply them
-  unless the user explicitly changed them in this message.{chart_note}
+- For follow-up questions: the full joined dataset is in context — use it directly.
+- If active filters are in the conversation context, apply them unless the user changed them.{chart_note}{empty_note}
 
 Data context:
 {data_context}
 """
 
-    # ── Update conversation state after building the system prompt ────────────
-    topic_summary = f"{intent} query — {question[:80]}"
-    bump_topic(
-        new_intent=intent,
-        topic_summary=topic_summary,
-        router_filters=filters,
-    )
-    update_ctx(
-        last_df_columns=list(df.columns) if df is not None else [],
-    )
+    # ── Update conversation state ─────────────────────────────────────────────
+    topic_summary = f"{intent} — {question[:80]}"
+    bump_topic(new_intent=intent, topic_summary=topic_summary, router_filters=filters)
+    update_ctx(last_df_columns=list(df.columns) if df is not None else [])
 
-    # ── Debug info package ────────────────────────────────────────────────────
+    # ── Intent-based token budget ─────────────────────────────────────────────
+    max_tokens = INTENT_MAX_TOKENS.get(intent, DEFAULT_MAX_TOKENS)
+
+    # ── Debug info ────────────────────────────────────────────────────────────
     retrieval_mode = (
         "fresh_join" if (needs_fresh or is_followup) else
         "vector"     if use_vector else
@@ -708,9 +803,9 @@ Data context:
         "data_context":   data_context,
         "system_prompt":  system,
         "conv_context":   conv_context_block,
+        "max_tokens":     max_tokens,
     }
 
-    # Pass more history to the AI — up to 14 messages for 5+ turn coherence
     messages = history[-14:] + [{"role": "user", "content": question}]
-    stream   = stream_model(messages, system, model_name)
+    stream   = stream_model(messages, system, model_name, max_tokens)
     return stream, chart, df, debug_info
