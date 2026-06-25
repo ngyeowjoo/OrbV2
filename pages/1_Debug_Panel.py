@@ -203,6 +203,7 @@ else:
                         "needs_flash_reward": routing.get("needs_flash_reward", "--"),
                         "needs_flash_home":   routing.get("needs_flash_home", "--"),
                         "is_followup":        routing.get("is_followup", False),
+                        "max_tokens_used":    entry.get("max_tokens", 1200),
                     })
                 with col_b:
                     st.markdown(f'<p style="font-family:DM Mono,monospace;font-size:0.68rem;text-transform:uppercase;color:{SUBTEXT};margin-bottom:6px;">Filters</p>', unsafe_allow_html=True)
