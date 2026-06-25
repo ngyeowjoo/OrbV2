@@ -59,6 +59,7 @@ def log_interaction(
     ai_response:    str,
     vector_docs:    list = None,
     latency_ms:     dict = None,
+    max_tokens:     int  = None,
 ):
     """Append one interaction. Newest entry first. Max MAX_ENTRIES kept."""
     entry = {
@@ -72,6 +73,7 @@ def log_interaction(
         "ai_response":    ai_response,
         "vector_docs":    vector_docs or [],
         "latency_ms":     latency_ms or {},
+        "max_tokens":     max_tokens,
     }
 
     # Try file store first
