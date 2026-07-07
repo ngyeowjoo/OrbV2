@@ -185,7 +185,103 @@ thresholds:
   # Country / scope
   global_scope_keyword: ALL       # sentinel value for global access
 
-# ── FIELD ALIASES ─────────────────────────────────────────────────────────────
+  tier:
+    - tier achieved
+    - payout tier
+    - incentive tier
+    - which tier
+    - tier level
+    - tier reached
+    - tier attained
+
+  kpi_trend:
+    - kpi over time
+    - performance over time
+    - payout history
+    - trend over cycles
+    - trend across cycles
+    - performance trend
+    - over the last N cycles
+    - over the last N months
+    - historical performance
+    - payout over time
+    - proration trend
+    - attendance trend
+
+  project_compare:
+    - compare projects
+    - project vs project
+    - by project
+    - per project
+    - across projects
+    - project breakdown
+    - project performance
+    - compare sites
+
+  tenure_compare:
+    - by tenure
+    - tenure band
+    - tenure group
+    - years of service
+    - long tenured
+    - short tenured
+    - employees with X years
+    - compare tenure
+    - tenure vs payout
+    - tenure cohort
+
+  missing_kpi:
+    - no kpi uploaded
+    - kpi not uploaded
+    - missing kpi
+    - kpi not submitted
+    - no data this cycle
+    - not in the system this cycle
+    - haven't uploaded
+    - kpi gap
+    - no performance data
+
+  adjustment:
+    - kpi adjustment
+    - adjusted kpi
+    - adjustment made
+    - kpi changed
+    - modified kpi
+    - override
+    - pending adjustment
+    - approved adjustment
+    - rejected adjustment
+    - adjustment status
+
+  scheme_config:
+    - scheme details
+    - scheme tiers
+    - kpi weightage
+    - kpi weight
+    - scheme structure
+    - incentive structure
+    - scheme configuration
+    - how is the scheme set up
+    - scheme acknowledgement
+    - acknowledged scheme
+    - scheme expiry
+    - scheme end date
+    - when does scheme end
+
+  login:
+    - last login
+    - last logged in
+    - when did employee log in
+    - login activity
+    - login history
+
+  announcement:
+    - announcement
+    - announcements active
+    - notice
+    - notices
+
+# ── FIELD ALIASES (updated with real schema columns) ──────────────────────────
 # Maps user-facing terms to actual column names in the data.
 # Used in filter extraction and display.
 
@@ -206,9 +302,10 @@ field_aliases:
   status:           EmployeeStatus
   join date:        JoinDate
   start date:       JoinDate
+  hire date:        EmployeeHireDate
   last date:        LastDate
   exit date:        LastDate
-  department:       Project
+  department:       EmployeeDepartment
   team:             Project
   location:         Country
   country:          Country
@@ -216,6 +313,31 @@ field_aliases:
   target:           Target
   achieved:         Achieved
   qualifier:        QualifierFailed
+  # New from real schema
+  job title:        JobTitle
+  title:            JobTitle
+  position:         JobTitle
+  grade:            EmployeeGrade
+  job grade:        EmployeeGrade
+  employee grade:   EmployeeGrade
+  supervisor:       SupervisorFlashID
+  manager:          SupervisorFlashID
+  reports to:       SupervisorFlashID
+  weightage:        Weightage
+  weight:           Weightage
+  kpi weight:       Weightage
+  tier:             Tier
+  tier achieved:    RecordedTier
+  adjusted kpi:     AdjustedKPI
+  recorded kpi:     RecordedKPI
+  adjustment status: KPIAdjustmentStatus
+  cycle start:      CycleStartDate
+  cycle end:        CycleEndDate
+  upload cutoff:    CycleUploadCutoffDate
+  acknowledgement:  IncentiveSchemeAcknowledgement
+  acknowledged:     IncentiveSchemeAcknowledgement
+  last login:       LoginDate
+  login date:       LoginDate
 
 # ── INTENT HINTS ──────────────────────────────────────────────────────────────
 # Extra phrases (beyond regex) that force a specific intent.
@@ -265,6 +387,73 @@ intent_hints:
     - overall performance this cycle
     - recap this cycle
     - cycle performance
+
+  kpi_trend:
+    - show trend
+    - over the last
+    - across cycles
+    - performance over time
+    - payout history
+    - payout over time
+    - proration trend
+    - attendance trend
+    - historical kpi
+    - kpi history
+    - trend for employee
+
+  project_compare:
+    - compare projects
+    - project vs project
+    - project a vs project b
+    - by project breakdown
+    - per project
+    - across projects
+    - project level
+    - which project performs
+
+  tenure_compare:
+    - by tenure
+    - tenure band
+    - tenure cohort
+    - years of service
+    - long tenured vs short
+    - compared by tenure
+    - X years vs Y years
+
+  missing_kpi:
+    - no kpi this cycle
+    - kpi not uploaded
+    - missing kpi
+    - not in system
+    - no performance data
+    - kpi gap
+    - haven't submitted kpi
+    - scheme but no kpi
+
+  adjustment:
+    - kpi adjustment
+    - pending adjustment
+    - approved adjustment
+    - adjustment status
+    - adjusted kpi
+    - kpi override
+    - qualifying status adjustment
+
+  scheme_config:
+    - scheme tiers
+    - kpi weightage
+    - how is the scheme
+    - scheme structure
+    - scheme configuration
+    - acknowledged scheme
+    - scheme acknowledgement
+    - scheme expiry
+    - when does scheme end
+
+  login:
+    - last login
+    - last logged in
+    - login activity
 
   cross_join:
     - tell me who they are
