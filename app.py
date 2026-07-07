@@ -27,21 +27,77 @@ st.set_page_config(
 
 AMBER   = "#D97706"
 AMBERL  = "#FEF3C7"
-BG      = "#F9FAFB"
-CARD    = "#FFFFFF"
-BORDER  = "#E5E7EB"
-TEXT    = "#111827"
-SUBTEXT = "#6B7280"
-USERBG  = "#F3F4F6"
-SB_BG   = "#111827"
-SB_TEXT = "#F9FAFB"
-SB_SUB  = "#9CA3AF"
-SB_HVR  = "#1F2937"
-SB_ACT  = "#374151"
+
+# ── Theme palettes ─────────────────────────────────────────────────────────────
+_THEMES = {
+    "light": {
+        "BG":           "#F9FAFB",
+        "CARD":         "#FFFFFF",
+        "BORDER":       "#E5E7EB",
+        "TEXT":         "#111827",
+        "SUBTEXT":      "#6B7280",
+        "USERBG":       "#F3F4F6",
+        "SB_BG":        "#111827",
+        "SB_TEXT":      "#F9FAFB",
+        "SB_SUB":       "#9CA3AF",
+        "SB_HVR":       "#1F2937",
+        "SB_ACT":       "#374151",
+        "INPUT_BG":     "#FFFFFF",
+        "SCROLLTRACK":  "#f1f1f1",
+        "SCROLLTHUMB":  "#d1d5db",
+        "ASSISTANT_BG": "#FFFFFF",
+        "USER_BG":      "#F3F4F6",
+        "AMBERL":       "#FEF3C7",
+    },
+    "dark": {
+        "BG":           "#0F1117",
+        "CARD":         "#1A1D27",
+        "BORDER":       "#2D3143",
+        "TEXT":         "#E5E7EB",
+        "SUBTEXT":      "#9CA3AF",
+        "USERBG":       "#252836",
+        "SB_BG":        "#0A0C14",
+        "SB_TEXT":      "#E5E7EB",
+        "SB_SUB":       "#6B7280",
+        "SB_HVR":       "#1A1D27",
+        "SB_ACT":       "#252836",
+        "INPUT_BG":     "#1A1D27",
+        "SCROLLTRACK":  "#1A1D27",
+        "SCROLLTHUMB":  "#374151",
+        "ASSISTANT_BG": "#1A1D27",
+        "USER_BG":      "#252836",
+        "AMBERL":       "#451A03",
+    },
+}
+
+def _get_theme() -> dict:
+    """Returns current theme dict. Default: light."""
+    mode = st.session_state.get("theme_mode", "light")
+    return _THEMES.get(mode, _THEMES["light"])
+
+# ── Unpack theme into module-level names used throughout the file ──────────────
+_t      = _get_theme()
+BG      = _t["BG"]
+CARD    = _t["CARD"]
+BORDER  = _t["BORDER"]
+TEXT    = _t["TEXT"]
+SUBTEXT = _t["SUBTEXT"]
+USERBG  = _t["USERBG"]
+SB_BG   = _t["SB_BG"]
+SB_TEXT = _t["SB_TEXT"]
+SB_SUB  = _t["SB_SUB"]
+SB_HVR  = _t["SB_HVR"]
+SB_ACT  = _t["SB_ACT"]
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CSS
+# CSS  (re-runs each render so theme change takes effect immediately)
 # ══════════════════════════════════════════════════════════════════════════════
+_INPUT_BG    = _t["INPUT_BG"]
+_SCROLLTRACK = _t["SCROLLTRACK"]
+_SCROLLTHUMB = _t["SCROLLTHUMB"]
+_AMBERL      = _t["AMBERL"]
+_is_dark     = st.session_state.get("theme_mode", "light") == "dark"
+
 st.markdown(f"""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=DM+Mono:wght@300;400;500&family=Inter:wght@300;400;500;600&display=swap');
@@ -51,10 +107,10 @@ html, body, .stApp {{ background: {BG} !important; color: {TEXT}; }}
 #MainMenu, footer {{ display: none !important; }}
 .block-container {{ padding: 0 1rem !important; max-width: 100% !important; }}
 
-/* ── Sidebar — let Streamlit handle collapse/expand natively ── */
+/* ── Sidebar ── */
 section[data-testid="stSidebar"] {{
     background: {SB_BG} !important;
-    border-right: 1px solid #1F2937 !important;
+    border-right: 1px solid {'#1F2937' if not _is_dark else '#0A0C14'} !important;
 }}
 section[data-testid="stSidebar"] > div {{ background: {SB_BG} !important; }}
 section[data-testid="stSidebar"] * {{ color: {SB_TEXT} !important; }}
@@ -78,7 +134,7 @@ section[data-testid="stSidebar"] .new-chat-btn > button:hover {{
     background: rgba(217,119,6,0.28) !important;
 }}
 section[data-testid="stSidebar"] .signout-btn > button {{
-    background: transparent !important; border: 1px solid #374151 !important;
+    background: transparent !important; border: 1px solid {'#374151' if not _is_dark else '#2D3143'} !important;
     color: {SB_SUB} !important; border-radius: 8px !important; font-size: 0.80rem !important;
 }}
 section[data-testid="stSidebar"] .signout-btn > button:hover {{
@@ -87,20 +143,33 @@ section[data-testid="stSidebar"] .signout-btn > button:hover {{
 }}
 section[data-testid="stSidebar"] .del-btn > button {{
     background: transparent !important; border: none !important;
-    color: #4B5563 !important; font-size: 0.70rem !important;
+    color: {'#4B5563' if not _is_dark else '#374151'} !important; font-size: 0.70rem !important;
     padding: 3px 6px !important; border-radius: 4px !important;
     box-shadow: none !important; min-width: 0 !important;
 }}
 section[data-testid="stSidebar"] .del-btn > button:hover {{
     color: #FCA5A5 !important; background: rgba(239,68,68,0.1) !important;
 }}
+/* Theme toggle pill button in sidebar */
+section[data-testid="stSidebar"] .theme-toggle > button {{
+    background: {'rgba(255,255,255,0.06)' if _is_dark else 'rgba(0,0,0,0.04)'} !important;
+    border: 1px solid {BORDER} !important;
+    color: {SB_TEXT} !important; border-radius: 20px !important;
+    font-size: 0.78rem !important; font-weight: 500 !important;
+    padding: 5px 14px !important; width: 100% !important;
+    transition: all 0.2s !important;
+}}
+section[data-testid="stSidebar"] .theme-toggle > button:hover {{
+    border-color: {AMBER} !important; color: {AMBER} !important;
+    background: rgba(217,119,6,0.12) !important;
+}}
 
 ::-webkit-scrollbar {{ width: 4px; }}
-::-webkit-scrollbar-track {{ background: #f1f1f1; }}
-::-webkit-scrollbar-thumb {{ background: #d1d5db; border-radius: 2px; }}
+::-webkit-scrollbar-track {{ background: {_SCROLLTRACK}; }}
+::-webkit-scrollbar-thumb {{ background: {_SCROLLTHUMB}; border-radius: 2px; }}
 
 .stTextInput > div > div > input {{
-    background: {CARD} !important; border: 1px solid {BORDER} !important;
+    background: {_INPUT_BG} !important; border: 1px solid {BORDER} !important;
     border-radius: 10px !important; color: {TEXT} !important;
     font-family: 'Inter', sans-serif !important; font-size: 0.92rem !important;
     padding: 12px 16px !important; box-shadow: 0 1px 2px rgba(0,0,0,0.04) !important;
@@ -108,7 +177,7 @@ section[data-testid="stSidebar"] .del-btn > button:hover {{
 .stTextInput > div > div > input:focus {{
     border-color: {AMBER} !important; box-shadow: 0 0 0 3px rgba(217,119,6,0.1) !important;
 }}
-.stTextInput > div > div > input::placeholder {{ color: #9CA3AF !important; }}
+.stTextInput > div > div > input::placeholder {{ color: {'#4B5563' if _is_dark else '#9CA3AF'} !important; }}
 .stTextInput label {{ display: none !important; }}
 
 .stButton > button, [data-testid="stFormSubmitButton"] > button {{
@@ -119,7 +188,7 @@ section[data-testid="stSidebar"] .del-btn > button:hover {{
     box-shadow: 0 1px 2px rgba(0,0,0,0.04) !important; transition: all 0.15s !important;
 }}
 .stButton > button:hover, [data-testid="stFormSubmitButton"] > button:hover {{
-    border-color: {AMBER} !important; color: {AMBER} !important; background: {AMBERL} !important;
+    border-color: {AMBER} !important; color: {AMBER} !important; background: {_AMBERL} !important;
 }}
 .send-btn > div > button, .send-btn [data-testid="stFormSubmitButton"] > button {{
     background: {AMBER} !important; border: none !important;
@@ -135,6 +204,7 @@ section[data-testid="stSidebar"] .del-btn > button:hover {{
 div[data-testid="stSelectbox"] > div > div {{
     background: {CARD} !important; border: 1px solid {BORDER} !important;
     border-radius: 8px !important; font-family: 'Inter', sans-serif !important; font-size: 0.84rem !important;
+    color: {TEXT} !important;
 }}
 div[data-testid="stSelectbox"] label {{
     font-size: 0.70rem !important; font-weight: 600 !important;
@@ -147,10 +217,25 @@ div[data-testid="stSelectbox"] label {{
 [data-testid="stMetricLabel"] {{ color: {SUBTEXT} !important; font-size: 0.75rem !important; }}
 [data-testid="stMetricValue"] {{ color: {AMBER} !important; font-size: 1.4rem !important; font-weight:700 !important; }}
 [data-testid="stDataFrame"] {{ border: 1px solid {BORDER} !important; border-radius: 8px; }}
+[data-testid="stDataFrame"] * {{ color: {TEXT} !important; background: {CARD} !important; }}
 .stSpinner > div {{ border-top-color: {AMBER} !important; }}
 div[data-testid="stForm"] {{ border: none !important; padding: 0 !important; }}
 
-/* Compact centered suggestion cards */
+/* Expander */
+[data-testid="stExpander"] {{
+    background: {CARD} !important; border: 1px solid {BORDER} !important;
+    border-radius: 8px !important;
+}}
+[data-testid="stExpander"] summary {{ color: {TEXT} !important; }}
+
+/* Code blocks */
+.stCodeBlock, pre, code {{
+    background: {'#0D1117' if _is_dark else '#F3F4F6'} !important;
+    color: {'#E5E7EB' if _is_dark else '#111827'} !important;
+    border: 1px solid {BORDER} !important;
+}}
+
+/* Suggestion / clarification cards */
 .sug-card > button {{
     background: {CARD} !important; border: 1px solid {BORDER} !important;
     border-radius: 10px !important; color: {TEXT} !important;
@@ -160,7 +245,7 @@ div[data-testid="stForm"] {{ border: none !important; padding: 0 !important; }}
     box-shadow: 0 1px 3px rgba(0,0,0,0.05) !important; line-height: 1.35 !important;
 }}
 .sug-card > button:hover {{
-    border-color: {AMBER} !important; background: {AMBERL} !important; color: {AMBER} !important;
+    border-color: {AMBER} !important; background: {_AMBERL} !important; color: {AMBER} !important;
 }}
 
 /* Thinking indicator */
@@ -191,9 +276,10 @@ for k, v in {
     "selected_model":  DEFAULT_MODEL,
     "last_df":         None,
     "current_chat_id": None,
-    "vector_index_built": False,   # tracks whether FAISS index is ready
-    "_clarification_buttons": [],  # clickable option chips for clarifier
-    "_clarification_request": None, # active ClarificationRequest object
+    "vector_index_built": False,
+    "_clarification_buttons": [],
+    "_clarification_request": None,
+    "theme_mode":          "light",   # "light" | "dark"  — light is default
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -469,7 +555,15 @@ with st.sidebar:
     st.markdown("<div style='height:1px;background:#1F2937;margin:10px 0;'></div>",
                 unsafe_allow_html=True)
 
-    # ── Scope Pin ─────────────────────────────────────────────────────────────
+    # ── Theme Toggle ──────────────────────────────────────────────────────────
+    _cur_mode = st.session_state.get("theme_mode", "light")
+    _toggle_label = "☾  Dark mode" if _cur_mode == "light" else "☀  Light mode"
+    st.markdown('<div class="theme-toggle">', unsafe_allow_html=True)
+    if st.button(_toggle_label, key="theme_toggle_btn", use_container_width=True):
+        st.session_state["theme_mode"] = "dark" if _cur_mode == "light" else "light"
+        st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
     # Lets users with multi-country or global access pin a country for the session,
     # so they don't have to re-specify it every turn.
     user_countries = user.get("countries", [])
