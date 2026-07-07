@@ -34,6 +34,14 @@ KNOWN_INTENTS = [
     "pmgm",             # performance rating distribution
     "cycle_summary",    # overall cycle overview / brief me
     "country_compare",  # compare countries on any metric
+    "kpi_trend",        # time-series: KPI / payout / proration trend over cycles
+    "project_compare",  # compare projects on any metric (like country_compare but by project)
+    "tenure_compare",   # compare payout/KPI cohorts by tenure band
+    "missing_kpi",      # employees on scheme with no KPI record this cycle
+    "adjustment",       # KPI adjustments, qualifying status adjustments, approval workflow
+    "scheme_config",    # scheme structure: tiers, KPI weightage, acknowledgement, expiry
+    "login",            # last login, login activity
+    "announcement",     # announcements active during a cycle
     "free_form",        # anything else / complex multi-part
 ]
 
@@ -109,6 +117,40 @@ Q: "qualifier" / "who's blocked?" — intent: qualifier
 Q: "why did someone not get paid?" — intent: qualifier (most likely reason is qualifier failure)
 Q: "attendance issues?" — intent: proration
 Q: "partial payout" — intent: proration (attendance deduction)
+
+Q: "compare projects" — intent: project_compare (not country_compare — grouping by project not country)
+Q: "which project has the highest payout?" — intent: project_compare
+Q: "compare kpi between project a and project b" — intent: project_compare
+Q: "payout by project" — intent: project_compare
+
+Q: "show me the trend" / "over the last 6 months" — intent: kpi_trend (time-series, not attainment)
+Q: "payout history for employee" — intent: kpi_trend (historical lookup per person)
+Q: "kpi trend over last year" — intent: kpi_trend
+Q: "proration trend across cycles" — intent: kpi_trend
+
+Q: "compare employees with 1 year vs 3 years tenure" — intent: tenure_compare
+Q: "incentive by tenure band" — intent: tenure_compare
+Q: "do longer tenured employees earn more?" — intent: tenure_compare
+
+Q: "who hasn't had kpi uploaded?" — intent: missing_kpi (not employee_list — looking for gaps)
+Q: "which employees are on a scheme but have no kpi this cycle?" — intent: missing_kpi
+Q: "kpi not submitted" — intent: missing_kpi
+
+Q: "any kpi adjustments?" / "pending adjustments" — intent: adjustment
+Q: "was employee's kpi adjusted?" — intent: adjustment
+Q: "approval status of adjustment" — intent: adjustment
+Q: "qualifying status changes" — intent: adjustment
+
+Q: "what tiers does the scheme have?" — intent: scheme_config (not attainment)
+Q: "kpi weightage for scheme" — intent: scheme_config
+Q: "has employee acknowledged their scheme?" — intent: scheme_config
+Q: "when does the scheme expire?" — intent: scheme_config
+
+Q: "when did employee last log in?" — intent: login
+Q: "last login for employee" — intent: login
+
+Q: "any announcements this cycle?" — intent: announcement
+Q: "were there notices active during cycle?" — intent: announcement
 
 === END DISAMBIGUATION EXAMPLES ==="""
 
