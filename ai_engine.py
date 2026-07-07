@@ -46,6 +46,24 @@ C_BAD   = "#C0392B"
 C_GOOD  = "#27AE60"
 PALETTE = [C_AMBER, "#F59E0B", C_WARN, C_BAD, "#9B59B6", C_GOOD, "#3498DB"]
 
+def _get_plot_theme():
+    """Returns plotly layout theme dict based on current app theme."""
+    is_dark = st.session_state.get("theme_mode", "light") == "dark"
+    if is_dark:
+        return dict(
+            paper_bgcolor="#1A1D27", plot_bgcolor="#1A1D27",
+            font=dict(color="#9CA3AF", family="Inter, sans-serif", size=11),
+            margin=dict(l=32, r=16, t=40, b=32),
+            legend=dict(bgcolor="rgba(0,0,0,0)"),
+        )
+    return dict(
+        paper_bgcolor="#FFFFFF", plot_bgcolor="#FAFAFA",
+        font=dict(color="#374151", family="Inter, sans-serif", size=11),
+        margin=dict(l=32, r=16, t=40, b=32),
+        legend=dict(bgcolor="rgba(0,0,0,0)"),
+    )
+
+# Keep PLOT_THEME as a static fallback (used during import before session state exists)
 PLOT_THEME = dict(
     paper_bgcolor="#FFFFFF", plot_bgcolor="#FAFAFA",
     font=dict(color="#374151", family="Inter, sans-serif", size=11),
@@ -54,8 +72,10 @@ PLOT_THEME = dict(
 )
 
 def _fmt_axes(fig):
-    fig.update_xaxes(gridcolor="#E5E7EB", zeroline=False, linecolor="#E5E7EB")
-    fig.update_yaxes(gridcolor="#E5E7EB", zeroline=False, linecolor="#E5E7EB")
+    is_dark = st.session_state.get("theme_mode", "light") == "dark"
+    grid = "#2D3143" if is_dark else "#E5E7EB"
+    fig.update_xaxes(gridcolor=grid, zeroline=False, linecolor=grid)
+    fig.update_yaxes(gridcolor=grid, zeroline=False, linecolor=grid)
 
 # ── INTENT CLASSIFIER ─────────────────────────────────────────────────────────
 INTENT_PATTERNS = {
@@ -269,6 +289,187 @@ def retrieve_data(intent: str, countries: list, question: str):
         result_df = _add_names(cyc[["EmployeeID","Scheme","TotalCyclePayout","SchemeMaxPayout","ProrFactor"]].head(50), countries)
         return result_df, desc
 
+    elif intent == "kpi_trend":
+        fr  = get_flash_reward(countries)
+        fh  = get_flash_home(countries)
+        emp_id = None
+        for eid in fh["EmployeeID"].unique():
+            if eid.lower() in question.lower():
+                emp_id = eid
+                break
+        if emp_id is None and "EmployeeName" in fh.columns:
+            for _, row in fh.iterrows():
+                if row["EmployeeName"] and str(row["EmployeeName"]).lower() in question.lower():
+                    emp_id = row["EmployeeID"]
+                    break
+        if emp_id:
+            emp_fr = fr[fr["EmployeeID"] == emp_id].copy()
+            emp_name_vals = fh[fh["EmployeeID"] == emp_id]["EmployeeName"].values
+            emp_name = emp_name_vals[0] if len(emp_name_vals) else emp_id
+            cyc_agg = emp_fr.groupby("Cycle").agg(
+                TotalPayout=("TotalCyclePayout", "first"),
+                ProrFactor=("ProrFactor", "first"),
+                Scheme=("Scheme", "first"),
+            ).reset_index().sort_values("Cycle")
+            metric_trend = emp_fr.groupby(["Cycle","Metric"]).agg(
+                Target=("Target","first"),
+                Achieved=("Achieved","first"),
+                MetricPayout=("MetricPayout","sum"),
+            ).reset_index().sort_values(["Cycle","Metric"])
+            desc = (
+                f"KPI trend for {emp_name} ({emp_id}), scope: {scope}\n"
+                f"Cycle-level payout and proration:\n{cyc_agg.to_string(index=False)}\n\n"
+                f"Per-metric performance across cycles:\n{metric_trend.to_string(index=False)}"
+            )
+            return cyc_agg, desc
+        else:
+            cyc_agg = fr.groupby("Cycle").agg(
+                AvgPayout=("TotalCyclePayout","mean"),
+                TotalPayout=("TotalCyclePayout","sum"),
+                Employees=("EmployeeID","nunique"),
+                AvgAchieved=("Achieved","mean"),
+            ).reset_index().sort_values("Cycle")
+            pror_trend = fr[fr["ProrFactor"]<1.0].groupby("Cycle").agg(
+                ProratedCount=("EmployeeID","nunique"),
+                AvgProrFactor=("ProrFactor","mean"),
+            ).reset_index()
+            cyc_agg = cyc_agg.merge(pror_trend, on="Cycle", how="left").fillna(0)
+            return cyc_agg, f"KPI/payout trend across all cycles, scope: {scope}\n{cyc_agg.to_string(index=False)}"
+
+    elif intent == "project_compare":
+        fr  = get_flash_reward(countries)
+        fh  = get_flash_home(countries)
+        latest = fr["Cycle"].max()
+        cyc    = fr[fr["Cycle"]==latest].drop_duplicates("EmployeeID")
+        merged = cyc.merge(fh[["EmployeeID","Project","Country","PMGMRating"]], on="EmployeeID", how="left")
+        comp = merged.groupby("Project").agg(
+            Employees=("EmployeeID","count"),
+            AvgPayout=("TotalCyclePayout","mean"),
+            TotalPayout=("TotalCyclePayout","sum"),
+            MaxPayout=("TotalCyclePayout","max"),
+            AvgAchieved=("Achieved","mean"),
+            QualFailures=("QualifierFailed", lambda x: x.notna().sum()),
+            Prorated=("ProrFactor", lambda x: (x<1.0).sum()),
+        ).reset_index().round(2)
+        return comp, f"Project comparison for cycle {latest}, scope: {scope}\n{comp.to_string(index=False)}"
+
+    elif intent == "tenure_compare":
+        fr  = get_flash_reward(countries)
+        fh  = get_flash_home(countries)
+        latest = fr["Cycle"].max()
+        cyc    = fr[fr["Cycle"]==latest].drop_duplicates("EmployeeID")
+        fh_t = fh[["EmployeeID","JoinDate","EmployeeName","Project","Country"]].copy()
+        fh_t["TenureYears"] = ((pd.Timestamp.today() - fh_t["JoinDate"]).dt.days / 365.25).round(1)
+        def _band(y):
+            if pd.isna(y): return "Unknown"
+            if y < 1:  return "< 1 year"
+            if y < 2:  return "1–2 years"
+            if y < 3:  return "2–3 years"
+            if y < 5:  return "3–5 years"
+            if y < 10: return "5–10 years"
+            return "10+ years"
+        fh_t["TenureBand"] = fh_t["TenureYears"].apply(_band)
+        merged = cyc.merge(fh_t, on="EmployeeID", how="left")
+        band_order = ["< 1 year","1–2 years","2–3 years","3–5 years","5–10 years","10+ years","Unknown"]
+        comp = merged.groupby("TenureBand").agg(
+            Employees=("EmployeeID","count"),
+            AvgPayout=("TotalCyclePayout","mean"),
+            TotalPayout=("TotalCyclePayout","sum"),
+            AvgAchieved=("Achieved","mean"),
+        ).reset_index().round(2)
+        comp["TenureBand"] = pd.Categorical(comp["TenureBand"], categories=band_order, ordered=True)
+        comp = comp.sort_values("TenureBand")
+        return comp, f"Incentive by tenure band, cycle {latest}, scope: {scope}\n{comp.to_string(index=False)}"
+
+    elif intent == "missing_kpi":
+        fr  = get_flash_reward(countries)
+        fh  = get_flash_home(countries)
+        latest = fr["Cycle"].max()
+        all_emp    = set(fr["EmployeeID"].unique())
+        in_latest  = set(fr[fr["Cycle"]==latest]["EmployeeID"].unique())
+        missing    = list(all_emp - in_latest)
+        fh_active  = fh[(fh["EmployeeStatus"]=="Active") & (fh["EmployeeID"].isin(missing))]
+        name_cols  = [c for c in ["EmployeeID","EmployeeName","Project","Country","PMGMRating"] if c in fh_active.columns]
+        last_scheme = (fr[fr["EmployeeID"].isin(missing)]
+                       .sort_values("Cycle")
+                       .groupby("EmployeeID")
+                       .last()[["Scheme","Cycle"]]
+                       .reset_index()
+                       .rename(columns={"Scheme":"LastKnownScheme","Cycle":"LastCycle"}))
+        df = fh_active[name_cols].merge(last_scheme, on="EmployeeID", how="left")
+        return df, (
+            f"Active employees on incentive with NO KPI record in latest cycle ({latest}), scope: {scope}\n"
+            f"Count: {len(df)} employees missing\n{df.to_string(index=False)}"
+        )
+
+    elif intent == "adjustment":
+        fr  = get_flash_reward(countries)
+        fh  = get_flash_home(countries)
+        latest = fr["Cycle"].max()
+        cyc = fr[fr["Cycle"]==latest].copy()
+        cyc_agg = cyc.groupby("EmployeeID").agg(
+            TotalCyclePayout=("TotalCyclePayout","first"),
+            SumMetricPayout=("MetricPayout","sum"),
+            QualifierFailed=("QualifierFailed", lambda x: x.dropna().iloc[0] if len(x.dropna()) else ""),
+            ProrFactor=("ProrFactor","first"),
+            Scheme=("Scheme","first"),
+        ).reset_index()
+        cyc_agg["PayoutDelta"] = (cyc_agg["TotalCyclePayout"] - cyc_agg["SumMetricPayout"]).round(2)
+        adjusted = cyc_agg[cyc_agg["PayoutDelta"].abs() > 0.01].copy()
+        adjusted = _add_names(adjusted, countries)
+        show = [c for c in ["EmployeeID","EmployeeName","Scheme","SumMetricPayout",
+                             "TotalCyclePayout","PayoutDelta","QualifierFailed","ProrFactor"] if c in adjusted.columns]
+        return adjusted, (
+            f"Payout adjustment data for cycle {latest}, scope: {scope}\n"
+            f"PayoutDelta = TotalCyclePayout minus sum of MetricPayouts.\n"
+            f"Full adjustment workflow (KPIAdjustment, ApprovalStatus, RecordedTier) available in real DB.\n"
+            f"Employees with payout delta: {len(adjusted)}\n{adjusted[show].to_string(index=False)}"
+        )
+
+    elif intent == "scheme_config":
+        fr  = get_flash_reward(countries)
+        latest = fr["Cycle"].max()
+        cyc = fr[fr["Cycle"]==latest]
+        scheme_summary = cyc.groupby("Scheme").agg(
+            MaxPayout=("SchemeMaxPayout","first"),
+            ActiveEmployees=("EmployeeID","nunique"),
+            Metrics=("Metric", lambda x: ", ".join(sorted(x.unique()))),
+            AvgAchieved=("Achieved","mean"),
+        ).reset_index().round(2)
+        metric_detail = cyc.groupby(["Scheme","Metric"]).agg(
+            Target=("Target","mean"),
+            AvgAchieved=("Achieved","mean"),
+            TotalMetricPayout=("MetricPayout","sum"),
+        ).reset_index().round(2)
+        return scheme_summary, (
+            f"Incentive scheme configuration for cycle {latest}, scope: {scope}\n\n"
+            f"Scheme summary:\n{scheme_summary.to_string(index=False)}\n\n"
+            f"KPI matrix per scheme:\n{metric_detail.to_string(index=False)}\n\n"
+            f"Note: Tier definitions (IncentiveSchemeTier), KPI weightage (IncentiveMatrix.Weightage), "
+            f"and acknowledgement status (IncentiveSchemeAcknowledgement) are in the real DB schema."
+        )
+
+    elif intent == "login":
+        fh = get_flash_home(countries)
+        cols = [c for c in ["EmployeeID","EmployeeName","Country","Project","EmployeeStatus"] if c in fh.columns]
+        df = fh[cols].copy()
+        return df, (
+            f"Login data, scope: {scope}\n"
+            f"Note: Last login timestamps come from LoginAuditLog.LoginDate in the real DB. "
+            f"Mock data does not include login records.\n{df.head(30).to_string(index=False)}"
+        )
+
+    elif intent == "announcement":
+        fr = get_flash_reward(countries)
+        latest = fr["Cycle"].max()
+        empty_df = pd.DataFrame(columns=["Message","StartDate","EndDate"])
+        return empty_df, (
+            f"Announcements for cycle {latest}, scope: {scope}\n"
+            f"Note: Announcement data is in the Announcement table (Message, StartDate, EndDate, Deleted) "
+            f"in the real DB. Active = StartDate <= today <= EndDate AND Deleted = 0. "
+            f"Mock data does not include announcement records."
+        )
+
     elif intent == "country_compare":
         fr     = get_flash_reward(countries)
         fh     = get_flash_home(countries)
@@ -310,7 +511,7 @@ def build_chart(intent: str, df):
             fig = px.bar(by_scheme, x="Scheme", y="HitMaxPct",
                          title="% Hitting Max Payout by Scheme",
                          color="Scheme", color_discrete_sequence=PALETTE)
-            fig.update_layout(**PLOT_THEME, yaxis_title="% Hit Max"); _fmt_axes(fig); return fig
+            fig.update_layout(**_get_plot_theme(), yaxis_title="% Hit Max"); _fmt_axes(fig); return fig
 
         elif intent == "underperformance":
             x_col = "EmployeeName" if "EmployeeName" in df.columns else "EmployeeID"
@@ -319,21 +520,21 @@ def build_chart(intent: str, df):
                          color="Country" if "Country" in df.columns else None,
                          title="Consecutive Cycles Below Target (Top 20)",
                          color_discrete_sequence=PALETTE)
-            fig.update_layout(**PLOT_THEME, xaxis_title="Employee"); _fmt_axes(fig); return fig
+            fig.update_layout(**_get_plot_theme(), xaxis_title="Employee"); _fmt_axes(fig); return fig
 
         elif intent == "qualifier":
             top = df.groupby("QualifierFailed")["TimesFailed"].sum().reset_index()
             fig = px.bar(top, x="QualifierFailed", y="TimesFailed",
                          title="Qualifier Failure Frequency",
                          color_discrete_sequence=[C_WARN])
-            fig.update_layout(**PLOT_THEME); _fmt_axes(fig); return fig
+            fig.update_layout(**_get_plot_theme()); _fmt_axes(fig); return fig
 
         elif intent == "proration":
             monthly = df.groupby("Cycle")["EmployeeID"].nunique().reset_index(name="ProatedCount")
             fig = px.line(monthly, x="Cycle", y="ProatedCount",
                           title="Prorated Employees per Cycle",
                           markers=True, color_discrete_sequence=[C_AMBER])
-            fig.update_layout(**PLOT_THEME); _fmt_axes(fig); return fig
+            fig.update_layout(**_get_plot_theme()); _fmt_axes(fig); return fig
 
         elif intent == "anomaly":
             fig = px.scatter(df, x="PayoutPct", y="PMGMRating",
@@ -341,19 +542,19 @@ def build_chart(intent: str, df):
                              title="Performance vs Payout Anomaly",
                              color_discrete_sequence=[C_BAD, C_WARN],
                              hover_data=["EmployeeID"])
-            fig.update_layout(**PLOT_THEME); _fmt_axes(fig); return fig
+            fig.update_layout(**_get_plot_theme()); _fmt_axes(fig); return fig
 
         elif intent == "headcount":
             fig = px.bar(df, x="Country", y="Count", color="EmployeeStatus",
                          title="Headcount by Country & Status",
                          color_discrete_sequence=[C_AMBER, C_WARN])
-            fig.update_layout(**PLOT_THEME, barmode="group"); _fmt_axes(fig); return fig
+            fig.update_layout(**_get_plot_theme(), barmode="group"); _fmt_axes(fig); return fig
 
         elif intent == "attrition":
             fig = px.bar(df, x="YearLeft", y="Count", color="Country",
                          title="Attrition by Year & Country",
                          color_discrete_sequence=PALETTE)
-            fig.update_layout(**PLOT_THEME); _fmt_axes(fig); return fig
+            fig.update_layout(**_get_plot_theme()); _fmt_axes(fig); return fig
 
         elif intent == "pmgm":
             order = ["Exceptional","Exceeds Expectations","Meets Expectations",
@@ -362,13 +563,13 @@ def build_chart(intent: str, df):
                          title="PMGM Rating Distribution",
                          category_orders={"PMGMRating": order},
                          color_discrete_sequence=PALETTE)
-            fig.update_layout(**PLOT_THEME); _fmt_axes(fig); return fig
+            fig.update_layout(**_get_plot_theme()); _fmt_axes(fig); return fig
 
         elif intent == "country_compare":
             fig = px.bar(df, x="Country", y="HitMaxPct",
                          title="% Hitting Max Payout by Country",
                          color="Country", color_discrete_sequence=PALETTE)
-            fig.update_layout(**PLOT_THEME, yaxis_tickformat=".0%"); _fmt_axes(fig); return fig
+            fig.update_layout(**_get_plot_theme(), yaxis_tickformat=".0%"); _fmt_axes(fig); return fig
 
         elif intent == "cross_check":
             if df.empty: return None
@@ -376,7 +577,47 @@ def build_chart(intent: str, df):
             fig = px.bar(df, x=x_col, y="TotalCyclePayout",
                          title="Non-Active Employees with Payouts",
                          color_discrete_sequence=[C_BAD])
-            fig.update_layout(**PLOT_THEME, xaxis_title="Employee"); _fmt_axes(fig); return fig
+            fig.update_layout(**_get_plot_theme(), xaxis_title="Employee"); _fmt_axes(fig); return fig
+
+        elif intent == "kpi_trend":
+            if "Cycle" not in df.columns: return None
+            y_col = "TotalPayout" if "TotalPayout" in df.columns else "AvgPayout"
+            title = "Payout Trend Across Cycles"
+            fig = px.line(df, x="Cycle", y=y_col, markers=True,
+                          title=title, color_discrete_sequence=[C_AMBER])
+            fig.update_layout(**_get_plot_theme(), yaxis_title="Payout"); _fmt_axes(fig); return fig
+
+        elif intent == "project_compare":
+            if "Project" not in df.columns: return None
+            fig = px.bar(df.sort_values("AvgPayout", ascending=False),
+                         x="Project", y="AvgPayout",
+                         color="Project", title="Average Payout by Project",
+                         color_discrete_sequence=PALETTE)
+            fig.update_layout(**_get_plot_theme(), yaxis_title="Avg Payout"); _fmt_axes(fig); return fig
+
+        elif intent == "tenure_compare":
+            if "TenureBand" not in df.columns: return None
+            fig = px.bar(df, x="TenureBand", y="AvgPayout",
+                         title="Average Payout by Tenure Band",
+                         color_discrete_sequence=[C_AMBER])
+            fig.update_layout(**_get_plot_theme(), yaxis_title="Avg Payout"); _fmt_axes(fig); return fig
+
+        elif intent == "adjustment":
+            if df.empty: return None
+            x_col = "EmployeeName" if "EmployeeName" in df.columns else "EmployeeID"
+            if "PayoutDelta" not in df.columns: return None
+            fig = px.bar(df.sort_values("PayoutDelta").head(30),
+                         x=x_col, y="PayoutDelta",
+                         title="Payout Delta (Adjustment Impact)",
+                         color_discrete_sequence=[C_WARN])
+            fig.update_layout(**_get_plot_theme(), xaxis_title="Employee"); _fmt_axes(fig); return fig
+
+        elif intent == "scheme_config":
+            if "Scheme" not in df.columns or "ActiveEmployees" not in df.columns: return None
+            fig = px.bar(df, x="Scheme", y="ActiveEmployees",
+                         color="Scheme", title="Active Employees per Scheme",
+                         color_discrete_sequence=PALETTE)
+            fig.update_layout(**_get_plot_theme(), yaxis_title="Employees"); _fmt_axes(fig); return fig
 
     except Exception:
         return None
@@ -407,8 +648,14 @@ INTENT_MAX_TOKENS = {
     "cross_check":      1400,
     "new_joiner":       1400,
     "free_form":        1400,
-    # lighter intents
-    "headcount":        1200,
+    "kpi_trend":        1800,
+    "project_compare":  1600,
+    "tenure_compare":   1400,
+    "missing_kpi":      1400,
+    "adjustment":       1600,
+    "scheme_config":    1600,
+    "login":            1000,
+    "announcement":     1000,
     "attrition":        1200,
     "pmgm":             1200,
 }
@@ -647,6 +894,8 @@ def answer(question: str, history: list, user: dict,
         "anomaly", "cross_check", "new_joiner", "ranking",
         "cycle_summary", "country_compare", "headcount", "attrition",
         "pmgm", "employee_list", "cross_join",
+        "kpi_trend", "project_compare", "tenure_compare",
+        "missing_kpi", "adjustment", "scheme_config", "login", "announcement",
     }
     use_vector = (
         VECTOR_STORE_ENABLED
