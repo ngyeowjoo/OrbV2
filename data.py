@@ -1,7 +1,24 @@
 """
-data.py  —  Data access layer for Orb v2 POC
-Loads mock_data.xlsx and exposes scoped query helpers.
-Swap load_data() for a MySQL connector in production.
+data.py  —  Data access layer for Orb v2
+Loads mock_data.xlsx and exposes country-scoped query helpers.
+Swap load_data() for a real DB connector in production.
+
+Sheets:
+  flash_home              tblEmployeeSGP + enriched fields
+  flash_reward            Incentive payout per metric per cycle
+  payout_cycle            PayoutCycle config (dates, cutoffs)
+  project_cycle           ProjectCycle dates per project
+  incentive_scheme        Scheme definitions
+  scheme_tier             IncentiveSchemeTier (tier thresholds)
+  incentive_matrix        KPI matrix (metrics + weightage per scheme)
+  scheme_acknowledgement  Employee acknowledgement status
+  scheme_audit            Scheme change history
+  kpi_adjustment          KPI adjustment + approval workflow
+  qualifying_employee     Qualifier pass/fail per cycle
+  qualifying_adj          Qualifier status adjustments
+  login_audit             Last login per employee
+  announcement            Active announcements per cycle
+  attendance              Attendance + proration data
 """
 import pandas as pd
 import streamlit as st
@@ -10,121 +27,220 @@ import hashlib
 
 DATA_FILE = Path(__file__).parent / "mock_data.xlsx"
 
+_DATE_COLS = {
+    "flash_home":             ["JoinDate", "LastDate", "LastLoginDate"],
+    "payout_cycle":           ["CycleStartDate","CycleEndDate",
+                               "CycleUploadCutoffDate","CycleAdjustmentCutoffDate",
+                               "CycleCutoffDate"],
+    "project_cycle":          ["ProjectCycleStartDate","ProjectCycleEndDate"],
+    "incentive_scheme":       ["StartDate","EndDate","CreatedDate","UpdatedDate"],
+    "scheme_acknowledgement": ["AcknowledgedAt"],
+    "scheme_audit":           ["ActionDate"],
+    "kpi_adjustment":         ["SubmittedDate","ApprovedDate"],
+    "qualifying_adj":         ["ActionDate"],
+    "login_audit":            ["LastLoginDate"],
+    "announcement":           ["StartDate","EndDate","CreatedDate"],
+}
+
 def _file_hash() -> str:
-    """MD5 of the Excel file — used to bust Streamlit's data cache when file changes."""
     try:
         return hashlib.md5(DATA_FILE.read_bytes()).hexdigest()
     except Exception:
         return "unknown"
 
-@st.cache_data(ttl=0)   # ttl=0 means: re-read on every app restart, no stale cache
+@st.cache_data(ttl=0)
 def load_data(_cache_key: str = ""):
-    """_cache_key is the file hash — changing it forces a cache bust."""
-    fh = pd.read_excel(DATA_FILE, sheet_name="flash_home",   parse_dates=["JoinDate", "LastDate"])
-    fr = pd.read_excel(DATA_FILE, sheet_name="flash_reward")
-    return fh, fr
+    """Loads all sheets. _cache_key (file hash) forces reload when file changes."""
+    sheets = [
+        "flash_home", "flash_reward", "payout_cycle", "project_cycle",
+        "incentive_scheme", "scheme_tier", "incentive_matrix",
+        "scheme_acknowledgement", "scheme_audit", "kpi_adjustment",
+        "qualifying_employee", "qualifying_adj", "login_audit",
+        "announcement", "attendance",
+    ]
+    data = {}
+    for s in sheets:
+        try:
+            parse = _DATE_COLS.get(s, [])
+            data[s] = pd.read_excel(DATA_FILE, sheet_name=s,
+                                    parse_dates=parse if parse else False)
+        except Exception as e:
+            data[s] = pd.DataFrame()
+    return data
 
-def get_data():
-    """Always passes the current file hash so the cache reloads when mock_data.xlsx changes."""
+def get_data() -> dict:
     return load_data(_cache_key=_file_hash())
 
 # ── COUNTRY-SCOPED ACCESSORS ──────────────────────────────────────────────────
-def get_flash_home(countries: list[str]) -> pd.DataFrame:
-    fh, _ = get_data()
+
+def get_flash_home(countries: list) -> pd.DataFrame:
+    d = get_data()
+    fh = d["flash_home"].copy()
     if "ALL" in countries:
-        return fh.copy()
+        return fh
     return fh[fh["Country"].isin(countries)].copy()
 
-def get_flash_reward(countries: list[str]) -> pd.DataFrame:
-    fh, fr = get_data()
+def get_flash_reward(countries: list) -> pd.DataFrame:
+    d  = get_data()
+    fh = d["flash_home"]
+    fr = d["flash_reward"].copy()
     if "ALL" not in countries:
-        allowed_ids = fh[fh["Country"].isin(countries)]["EmployeeID"]
-        fr = fr[fr["EmployeeID"].isin(allowed_ids)]
+        allowed = fh[fh["Country"].isin(countries)]["EmployeeID"]
+        fr = fr[fr["EmployeeID"].isin(allowed)]
     return fr.copy()
 
-def get_joined(countries: list[str]) -> pd.DataFrame:
-    """Flash Reward joined with Flash Home — country scoped."""
+def get_joined(countries: list) -> pd.DataFrame:
     fh = get_flash_home(countries)
     fr = get_flash_reward(countries)
-    name_col = ["EmployeeName"] if "EmployeeName" in fh.columns else []
-    return fr.merge(fh[["EmployeeID"] + name_col + ["Country", "Project", "EmployeeStatus",
-                         "JoinDate", "LastDate", "PMGMRating"]],
-                    on="EmployeeID", how="left")
+    keep = [c for c in ["EmployeeID","EmployeeName","Country","Project",
+                         "EmployeeStatus","JoinDate","LastDate","PMGMRating",
+                         "JobTitle","EmployeeGrade","EmployeeDepartment","SupervisorID"]
+            if c in fh.columns]
+    return fr.merge(fh[keep], on="EmployeeID", how="left")
 
-# ── SUMMARY HELPERS (used by intent handlers) ─────────────────────────────────
+def get_payout_cycle() -> pd.DataFrame:
+    return get_data()["payout_cycle"].copy()
+
+def get_project_cycle(countries: list = None) -> pd.DataFrame:
+    pc  = get_data()["project_cycle"].copy()
+    all_projects = _country_projects(countries)
+    if all_projects:
+        pc = pc[pc["ProjectName"].isin(all_projects)]
+    return pc
+
+def get_incentive_scheme() -> pd.DataFrame:
+    return get_data()["incentive_scheme"].copy()
+
+def get_scheme_tier() -> pd.DataFrame:
+    return get_data()["scheme_tier"].copy()
+
+def get_incentive_matrix() -> pd.DataFrame:
+    return get_data()["incentive_matrix"].copy()
+
+def get_scheme_ack(countries: list) -> pd.DataFrame:
+    d   = get_data()
+    fh  = get_flash_home(countries)
+    ack = d["scheme_acknowledgement"].copy()
+    return ack[ack["EmployeeID"].isin(fh["EmployeeID"])].copy()
+
+def get_scheme_audit() -> pd.DataFrame:
+    return get_data()["scheme_audit"].copy()
+
+def get_kpi_adjustment(countries: list) -> pd.DataFrame:
+    d   = get_data()
+    fh  = get_flash_home(countries)
+    adj = d["kpi_adjustment"].copy()
+    return adj[adj["EmployeeID"].isin(fh["EmployeeID"])].copy()
+
+def get_qualifying_employee(countries: list) -> pd.DataFrame:
+    d  = get_data()
+    fh = get_flash_home(countries)
+    qe = d["qualifying_employee"].copy()
+    return qe[qe["EmployeeID"].isin(fh["EmployeeID"])].copy()
+
+def get_qualifying_adj(countries: list) -> pd.DataFrame:
+    d  = get_data()
+    fh = get_flash_home(countries)
+    qa = d["qualifying_adj"].copy()
+    return qa[qa["EmployeeID"].isin(fh["EmployeeID"])].copy()
+
+def get_login_audit(countries: list) -> pd.DataFrame:
+    d   = get_data()
+    fh  = get_flash_home(countries)
+    log = d["login_audit"].copy()
+    return log[log["EmployeeID"].isin(fh["EmployeeID"])].copy()
+
+def get_announcement() -> pd.DataFrame:
+    return get_data()["announcement"].copy()
+
+def get_attendance(countries: list) -> pd.DataFrame:
+    d   = get_data()
+    fh  = get_flash_home(countries)
+    att = d["attendance"].copy()
+    return att[att["EmployeeID"].isin(fh["EmployeeID"])].copy()
+
+# ── HELPER ────────────────────────────────────────────────────────────────────
+
+def _country_projects(countries: list = None) -> list:
+    if not countries or "ALL" in countries:
+        return []
+    fh = get_flash_home(countries)
+    return fh["Project"].dropna().unique().tolist()
+
+
+# ── SUMMARY HELPERS (used by ai_engine intent handlers) ──────────────────────
+
 def attainment_summary(countries):
     fr = get_flash_reward(countries)
     fh = get_flash_home(countries)
     latest = fr["Cycle"].max()
-    cyc    = fr[fr["Cycle"] == latest].drop_duplicates(["EmployeeID", "Cycle"])
-    cyc    = cyc.groupby("EmployeeID").agg(
-        TotalCyclePayout=("TotalCyclePayout", "first"),
-        SchemeMaxPayout=("SchemeMaxPayout",   "first"),
-        Scheme=("Scheme",                     "first"),
-    ).reset_index()
+    cyc = (fr[fr["Cycle"] == latest]
+           .groupby("EmployeeID")
+           .agg(TotalCyclePayout=("TotalCyclePayout","first"),
+                SchemeMaxPayout=("SchemeMaxPayout","first"),
+                Scheme=("Scheme","first"))
+           .reset_index())
     cyc["HitMax"] = cyc["TotalCyclePayout"] >= cyc["SchemeMaxPayout"] * 0.999
-    # Enrich with name, country, project from Flash Home
-    name_cols = [c for c in ["EmployeeID","EmployeeName","Country","Project"] if c in fh.columns]
-    cyc = cyc.merge(fh[name_cols], on="EmployeeID", how="left")
-    return cyc, latest
+    name_cols = [c for c in ["EmployeeID","EmployeeName","Country","Project",
+                              "JobTitle","EmployeeGrade"] if c in fh.columns]
+    return cyc.merge(fh[name_cols], on="EmployeeID", how="left"), latest
 
 def underperformer_summary(countries, min_cycles=3):
     fr = get_flash_reward(countries)
     fh = get_flash_home(countries)
+    fr = fr.copy()
     fr["BelowTarget"] = fr["Achieved"] < fr["Target"]
-    emp_cycle = fr.groupby(["EmployeeID", "Cycle"])["BelowTarget"].any().reset_index()
-    emp_cycle = emp_cycle.sort_values(["EmployeeID", "Cycle"])
-
+    emp_cycle = fr.groupby(["EmployeeID","Cycle"])["BelowTarget"].any().reset_index()
+    emp_cycle = emp_cycle.sort_values(["EmployeeID","Cycle"])
     results = []
     for emp, grp in emp_cycle.groupby("EmployeeID"):
-        consecutive = 0
-        max_consec  = 0
-        for val in grp["BelowTarget"]:
-            if val:
-                consecutive += 1
-                max_consec = max(max_consec, consecutive)
-            else:
-                consecutive = 0
-        if max_consec >= min_cycles:
-            results.append({"EmployeeID": emp, "MaxConsecutiveMisses": max_consec})
+        consec = max_c = 0
+        for v in grp["BelowTarget"]:
+            consec = consec + 1 if v else 0
+            max_c  = max(max_c, consec)
+        if max_c >= min_cycles:
+            results.append({"EmployeeID": emp, "MaxConsecutiveMisses": max_c})
     df = pd.DataFrame(results)
     if df.empty:
         return df
-    name_cols = [c for c in ["EmployeeID","EmployeeName","Country","Project"] if c in fh.columns]
-    df = df.merge(fh[name_cols], on="EmployeeID", how="left")
-    return df
+    name_cols = [c for c in ["EmployeeID","EmployeeName","Country","Project",
+                              "JobTitle","EmployeeGrade"] if c in fh.columns]
+    return df.merge(fh[name_cols], on="EmployeeID", how="left")
 
 def qualifier_summary(countries):
-    fr = get_flash_reward(countries)
+    qe = get_qualifying_employee(countries)
     fh = get_flash_home(countries)
-    failed = fr[fr["QualifierFailed"] != ""].copy()
-    df = failed.groupby(["EmployeeID", "QualifierFailed"]).agg(
-        TimesFailed=("Cycle", "count"),
-        TotalPayoutBlocked=("MetricPayout", "sum")
-    ).reset_index()
-    name_cols = [c for c in ["EmployeeID","EmployeeName","Country"] if c in fh.columns]
-    df = df.merge(fh[name_cols], on="EmployeeID", how="left")
-    return df
+    failed = qe[qe["QualifierStatus"] == 0].copy()
+    df = (failed.groupby(["EmployeeID","Qualifier"])
+          .agg(TimesFailed=("Cycle","count"),
+               LastFailCycle=("Cycle","max"))
+          .reset_index())
+    name_cols = [c for c in ["EmployeeID","EmployeeName","Country","Project"] if c in fh.columns]
+    return df.merge(fh[name_cols], on="EmployeeID", how="left")
 
 def proration_summary(countries):
-    fr = get_flash_reward(countries)
-    prorated = fr[fr["ProrFactor"] < 1.0].drop_duplicates(["EmployeeID", "Cycle"])
-    prorated["PayoutLost"] = (prorated["SchemeMaxPayout"] - prorated["TotalCyclePayout"]).clip(lower=0)
-    return prorated
+    att  = get_attendance(countries)
+    fh   = get_flash_home(countries)
+    pror = att[att["ProrationFactor"] < 1.0].copy()
+    pror["DaysAbsent"] = pror["MaxWorkingDays"] - pror["DaysWorked"]
+    name_cols = [c for c in ["EmployeeID","EmployeeName","Country","Project"] if c in fh.columns]
+    return pror.merge(fh[name_cols], on="EmployeeID", how="left")
 
 def anomaly_summary(countries):
     fh = get_flash_home(countries)
     fr = get_flash_reward(countries)
     latest = fr["Cycle"].max()
-    cyc = fr[fr["Cycle"] == latest].groupby("EmployeeID").agg(
-        TotalCyclePayout=("TotalCyclePayout", "first"),
-        SchemeMaxPayout=("SchemeMaxPayout",   "first"),
-    ).reset_index()
-    name_cols = [c for c in ["EmployeeID","EmployeeName","Country","PMGMRating"] if c in fh.columns]
+    cyc = (fr[fr["Cycle"]==latest]
+           .groupby("EmployeeID")
+           .agg(TotalCyclePayout=("TotalCyclePayout","first"),
+                SchemeMaxPayout=("SchemeMaxPayout","first"))
+           .reset_index())
+    name_cols = [c for c in ["EmployeeID","EmployeeName","Country","PMGMRating",
+                              "Project","JobTitle"] if c in fh.columns]
     merged = cyc.merge(fh[name_cols], on="EmployeeID", how="inner")
     merged["PayoutPct"] = merged["TotalCyclePayout"] / merged["SchemeMaxPayout"]
-    top_ratings   = ["Exceptional", "Exceeds Expectations"]
-    bottom_ratings= ["Below Expectations", "Unsatisfactory"]
-    high_low = merged[(merged["PMGMRating"].isin(top_ratings))    & (merged["PayoutPct"] < 0.5)]
-    low_high  = merged[(merged["PMGMRating"].isin(bottom_ratings)) & (merged["PayoutPct"] >= 0.95)]
+    top_r  = ["Exceptional","Exceeds Expectations"]
+    bot_r  = ["Below Expectations","Unsatisfactory"]
+    high_low = merged[(merged["PMGMRating"].isin(top_r))  & (merged["PayoutPct"] < 0.5)]
+    low_high = merged[(merged["PMGMRating"].isin(bot_r))  & (merged["PayoutPct"] >= 0.95)]
     return high_low, low_high, latest
