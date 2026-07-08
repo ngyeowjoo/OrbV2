@@ -107,32 +107,40 @@ def detect_intent(question: str) -> str:
 
 # ── EMPLOYEE NAME ENRICHMENT ──────────────────────────────────────────────────
 def _add_names(df, countries):
-    """Merge EmployeeName from Flash Home, placed right after EmployeeID.
-    Safe if EmployeeName is missing from the source (e.g. old mock_data.xlsx)."""
+    """Merge name, job title, grade, department and supervisor from Flash Home.
+    Places EmployeeName right after EmployeeID. Safe if columns missing."""
     if df is None or df.empty or "EmployeeID" not in df.columns:
-        return df
-    if "EmployeeName" in df.columns:
         return df
     try:
         from data import get_flash_home
         fh = get_flash_home(countries)
-        if "EmployeeName" not in fh.columns:
-            return df   # source doesn't have names yet — skip silently
-        fh = fh[["EmployeeID", "EmployeeName"]]
-        df = df.merge(fh, on="EmployeeID", how="left")
-        cols = df.columns.tolist()
-        cols.remove("EmployeeName")
-        idx = cols.index("EmployeeID") + 1
-        cols.insert(idx, "EmployeeName")
-        return df[cols]
+        enrich = [c for c in ["EmployeeID","EmployeeName","JobTitle","EmployeeGrade",
+                               "EmployeeDepartment","SupervisorID"]
+                  if c in fh.columns and (c == "EmployeeID" or c not in df.columns)]
+        if len(enrich) <= 1:
+            return df   # nothing new to add
+        df = df.merge(fh[enrich], on="EmployeeID", how="left")
+        # Reorder: put EmployeeName right after EmployeeID
+        if "EmployeeName" in df.columns:
+            cols = df.columns.tolist()
+            cols.remove("EmployeeName")
+            cols.insert(cols.index("EmployeeID") + 1, "EmployeeName")
+            df = df[cols]
+        return df
     except Exception:
-        return df   # never crash the app over a name lookup
+        return df
 
 # ── DATA RETRIEVAL ────────────────────────────────────────────────────────────
 def retrieve_data(intent: str, countries: list, question: str):
-    from data import (attainment_summary, underperformer_summary,
-                      qualifier_summary, proration_summary, anomaly_summary,
-                      get_flash_home, get_flash_reward, get_joined)
+    from data import (
+        attainment_summary, underperformer_summary,
+        qualifier_summary, proration_summary, anomaly_summary,
+        get_flash_home, get_flash_reward, get_joined,
+        get_payout_cycle, get_project_cycle, get_incentive_scheme,
+        get_scheme_tier, get_incentive_matrix, get_scheme_ack,
+        get_scheme_audit, get_kpi_adjustment, get_qualifying_employee,
+        get_qualifying_adj, get_login_audit, get_announcement, get_attendance,
+    )
     scope = "Global" if "ALL" in countries else ", ".join(countries)
 
     if intent == "attainment":
@@ -150,20 +158,36 @@ def retrieve_data(intent: str, countries: list, question: str):
         return df, f"Employees with >={min_cycles} consecutive cycles below target, scope: {scope}.\n{df.to_string(index=False)}"
 
     elif intent == "qualifier":
-        df = qualifier_summary(countries)
-        fh = get_flash_home(countries)[["EmployeeID","Country"]]
-        df = df.merge(fh, on="EmployeeID", how="left")
-        df = _add_names(df, countries)
-        return df, f"Qualifier failure data, scope: {scope}.\n{df.to_string(index=False)}"
+        df  = qualifier_summary(countries)
+        fh  = get_flash_home(countries)
+        # Also pull qualifying_employee detail for latest cycle
+        qe  = get_qualifying_employee(countries)
+        fr  = get_flash_reward(countries)
+        latest = fr["Cycle"].max()
+        qe_latest = qe[qe["Cycle"] == latest]
+        fail_latest = qe_latest[qe_latest["QualifierStatus"] == 0]
+        fail_summary = fail_latest.groupby("Qualifier").agg(
+            FailCount=("EmployeeID","nunique")).reset_index()
+        return df, (
+            f"Qualifier failure data, scope: {scope}.\n"
+            f"Latest cycle ({latest}) failures by qualifier:\n{fail_summary.to_string(index=False)}\n\n"
+            f"All-time qualifier failure summary:\n{df.to_string(index=False)}"
+        )
 
     elif intent == "proration":
-        df = proration_summary(countries)
-        df = _add_names(df, countries)
-        show_cols = [c for c in ["EmployeeID","EmployeeName","Cycle","ProrFactor","PayoutLost"] if c in df.columns]
-        return df, (f"Attendance proration data, scope: {scope}.\n"
-                    f"Affected: {df['EmployeeID'].nunique()} employees, "
-                    f"total payout impact: {df['PayoutLost'].sum():,.2f}\n"
-                    f"{df[show_cols].head(40).to_string(index=False)}")
+        att  = get_attendance(countries)
+        fh   = get_flash_home(countries)
+        pror = att[att["ProrationFactor"] < 1.0].copy()
+        pror["DaysAbsent"] = pror["MaxWorkingDays"] - pror["DaysWorked"]
+        name_cols = [c for c in ["EmployeeID","EmployeeName","Country","Project"] if c in fh.columns]
+        pror = pror.merge(fh[name_cols], on="EmployeeID", how="left", suffixes=("","_fh"))
+        show = [c for c in ["EmployeeID","EmployeeName","Cycle","Country","Project",
+                             "DaysWorked","MaxWorkingDays","DaysAbsent","ProrationFactor"] if c in pror.columns]
+        return pror, (
+            f"Attendance proration data, scope: {scope}.\n"
+            f"Affected: {pror['EmployeeID'].nunique()} employees across {pror['Cycle'].nunique()} cycles\n"
+            f"{pror[show].head(50).to_string(index=False)}"
+        )
 
     elif intent == "anomaly":
         from semantic import get_threshold
@@ -189,15 +213,24 @@ def retrieve_data(intent: str, countries: list, question: str):
         return df, f"Non-active employees with payouts in latest cycle, scope: {scope}.\n{df.to_string(index=False)}"
 
     elif intent == "new_joiner":
+        import re as _re
         fh = get_flash_home(countries)
         fr = get_flash_reward(countries)
-        cutoff = pd.Timestamp.today() - pd.DateOffset(months=6)
-        new    = fh[(fh["JoinDate"]>=cutoff) & (fh["EmployeeStatus"]=="Active")]
+        # Extract month count from question (e.g. "last 3 months")
+        m = _re.search(r'(\d+)\s*month', question, _re.IGNORECASE)
+        months = int(m.group(1)) if m else 6
+        cutoff = pd.Timestamp.today() - pd.DateOffset(months=months)
+        new    = fh[(fh["JoinDate"] >= cutoff) & (fh["EmployeeStatus"] == "Active")]
         latest = fr["Cycle"].max()
-        fr_l   = fr[fr["Cycle"]==latest].drop_duplicates("EmployeeID")
+        fr_l   = fr[fr["Cycle"] == latest].drop_duplicates("EmployeeID")
         df     = new.merge(fr_l[["EmployeeID","Scheme","TotalCyclePayout","ProrFactor"]], on="EmployeeID", how="left")
-        show_cols = [c for c in ["EmployeeID","EmployeeName","JoinDate","Country","Scheme","TotalCyclePayout","ProrFactor"] if c in df.columns]
-        return df, f"New joiners (last 6 months) on incentive, scope: {scope}.\n{df[show_cols].to_string(index=False)}"
+        show   = [c for c in ["EmployeeID","EmployeeName","JoinDate","Country","Project",
+                               "JobTitle","EmployeeGrade","Scheme","TotalCyclePayout","ProrFactor"] if c in df.columns]
+        return df, (
+            f"New joiners (last {months} months) on incentive, scope: {scope}.\n"
+            f"Count: {len(df)} employees joined since {cutoff.strftime('%d %b %Y')}\n"
+            f"{df[show].to_string(index=False)}"
+        )
 
     elif intent == "ranking":
         # Payout ranking — top/bottom N, above/below average, by country
@@ -229,43 +262,71 @@ def retrieve_data(intent: str, countries: list, question: str):
 
     elif intent == "employee_list":
         fh = get_flash_home(countries)
-        cols = [c for c in ["EmployeeID","EmployeeName","Country","Project",
-                             "EmployeeStatus","PMGMRating"] if c in fh.columns]
+        cols = [c for c in ["EmployeeID","EmployeeName","Country","Project","EmployeeDepartment",
+                             "EmployeeStatus","JobTitle","EmployeeGrade","PMGMRating",
+                             "JoinDate","SupervisorID"] if c in fh.columns]
         df = fh[cols].copy()
-        has_names = "EmployeeName" in df.columns
-        return df, (f"Employee directory, scope: {scope}. Total: {len(df)} employees.\n"
-                    f"{'EmployeeName is included in the data.' if has_names else 'Note: EmployeeName not available.'}\n"
-                    f"{df.to_string(index=False)}")
+        return df, (
+            f"Employee directory, scope: {scope}. Total: {len(df)} employees.\n"
+            f"Includes: job title, grade, department, supervisor, join date.\n"
+            f"{df.to_string(index=False)}"
+        )
 
     elif intent == "cross_join":
-        # Follow-up intent: user wants to identify employees from a prior result.
-        # Do a full joined lookup of latest cycle with names.
         fr  = get_flash_reward(countries)
         fh  = get_flash_home(countries)
         latest = fr["Cycle"].max()
         cyc = fr[fr["Cycle"] == latest].drop_duplicates("EmployeeID")
         name_cols = [c for c in ["EmployeeID","EmployeeName","Country","Project",
-                                  "EmployeeStatus","PMGMRating"] if c in fh.columns]
+                                  "EmployeeStatus","PMGMRating","JobTitle","EmployeeGrade",
+                                  "SupervisorID","JoinDate"] if c in fh.columns]
         df = cyc.merge(fh[name_cols], on="EmployeeID", how="left")
         show = [c for c in ["EmployeeID","EmployeeName","Scheme","TotalCyclePayout",
                              "SchemeMaxPayout","QualifierFailed","ProrFactor",
-                             "Country","Project","PMGMRating"] if c in df.columns]
-        df = df[show]
-        return df, (f"Full employee-level joined data for cycle {latest}, scope: {scope}.\n"
-                    f"Use this to identify specific employees from the prior question.\n"
-                    f"{df.to_string(index=False)}")
+                             "Country","Project","PMGMRating","JobTitle","EmployeeGrade"] if c in df.columns]
+        return df[show], (
+            f"Full employee-level joined data for cycle {latest}, scope: {scope}.\n"
+            f"Includes: name, grade, title, payout, qualifier, proration.\n"
+            f"{df[show].to_string(index=False)}"
+        )
 
     elif intent == "headcount":
         fh   = get_flash_home(countries)
-        summ = fh.groupby(["Country","EmployeeStatus"]).size().reset_index(name="Count")
-        return summ, f"Headcount by country and status, scope: {scope}.\n{summ.to_string(index=False)}"
+        summ = fh.groupby(["Country","Project","EmployeeStatus"]).size().reset_index(name="Count")
+        by_grade = fh.groupby(["EmployeeGrade","EmployeeStatus"]).size().reset_index(name="Count") if "EmployeeGrade" in fh.columns else pd.DataFrame()
+        total = len(fh)
+        active = (fh["EmployeeStatus"] == "Active").sum()
+        desc = (
+            f"Headcount by country, project and status, scope: {scope}. "
+            f"Total: {total}, Active: {active}, Non-Active: {total-active}\n"
+            f"{summ.to_string(index=False)}"
+        )
+        if not by_grade.empty:
+            desc += f"\n\nBy grade:\n{by_grade.to_string(index=False)}"
+        return summ, desc
 
     elif intent == "attrition":
         fh      = get_flash_home(countries)
-        leavers = fh[fh["EmployeeStatus"]=="Non-Active"].copy()
-        leavers["YearLeft"] = leavers["LastDate"].dt.year
-        summ    = leavers.groupby(["Country","YearLeft"]).size().reset_index(name="Count")
-        return summ, f"Attrition data, scope: {scope}.\n{summ.to_string(index=False)}"
+        leavers = fh[fh["EmployeeStatus"] == "Non-Active"].copy()
+        leavers["YearLeft"]    = leavers["LastDate"].dt.year
+        leavers["TenureYears"] = ((leavers["LastDate"] - leavers["JoinDate"]).dt.days / 365.25).round(1)
+        summ = leavers.groupby(["Country","YearLeft"]).size().reset_index(name="Count")
+        show = [c for c in ["EmployeeID","EmployeeName","Country","Project","JobTitle",
+                             "JoinDate","LastDate","TenureYears","PMGMRating"] if c in leavers.columns]
+        fr   = get_flash_reward(countries)
+        latest = fr["Cycle"].max()
+        leavers_with_pay = leavers.merge(
+            fr[fr["Cycle"]==latest].drop_duplicates("EmployeeID")[["EmployeeID","TotalCyclePayout"]],
+            on="EmployeeID", how="left"
+        )
+        with_pay = leavers_with_pay[leavers_with_pay["TotalCyclePayout"].notna() &
+                                    (leavers_with_pay["TotalCyclePayout"] > 0)]
+        return leavers, (
+            f"Attrition data, scope: {scope}. Total leavers: {len(leavers)}\n"
+            f"By country and year:\n{summ.to_string(index=False)}\n\n"
+            f"Leavers with payout in latest cycle ({latest}): {len(with_pay)}\n"
+            f"Leaver details:\n{leavers[show].to_string(index=False)}"
+        )
 
     elif intent == "pmgm":
         fh   = get_flash_home(countries)
@@ -273,20 +334,46 @@ def retrieve_data(intent: str, countries: list, question: str):
         return dist, f"PMGM rating distribution, scope: {scope}.\n{dist.to_string(index=False)}"
 
     elif intent == "cycle_summary":
-        fr      = get_flash_reward(countries)
-        latest  = fr["Cycle"].max()
-        cyc     = fr[fr["Cycle"]==latest].drop_duplicates(["EmployeeID"])
-        total_p = cyc["TotalCyclePayout"].sum()
-        avg_pct = (cyc["TotalCyclePayout"]/cyc["SchemeMaxPayout"]).mean()
-        hit_max = (cyc["TotalCyclePayout"]>=cyc["SchemeMaxPayout"]*0.999).sum()
-        q_fail  = fr[(fr["Cycle"]==latest)&(fr["QualifierFailed"]!="")]["EmployeeID"].nunique()
-        prorat  = fr[(fr["Cycle"]==latest)&(fr["ProrFactor"]<1.0)]["EmployeeID"].nunique()
-        desc    = (f"Cycle: {latest}, Scope: {scope}\n"
-                   f"Total eligible employees: {len(cyc)}\nTotal payout: {total_p:,.2f}\n"
-                   f"Average payout as % of max: {avg_pct:.1%}\n"
-                   f"Hit max payout: {hit_max} ({hit_max/len(cyc):.1%})\n"
-                   f"Qualifier failures: {q_fail}\nProrated for attendance: {prorat}\n")
-        result_df = _add_names(cyc[["EmployeeID","Scheme","TotalCyclePayout","SchemeMaxPayout","ProrFactor"]].head(50), countries)
+        fr     = get_flash_reward(countries)
+        fh     = get_flash_home(countries)
+        qe     = get_qualifying_employee(countries)
+        pc     = get_payout_cycle()
+        latest = fr["Cycle"].max()
+        cyc    = fr[fr["Cycle"] == latest].drop_duplicates("EmployeeID")
+        total_p   = cyc["TotalCyclePayout"].sum()
+        avg_pct   = (cyc["TotalCyclePayout"] / cyc["SchemeMaxPayout"]).mean()
+        hit_max   = (cyc["TotalCyclePayout"] >= cyc["SchemeMaxPayout"] * 0.999).sum()
+        att       = get_attendance(countries)
+        prorat    = att[(att["Cycle"] == latest) & (att["ProrationFactor"] < 1.0)]["EmployeeID"].nunique()
+        q_fail    = qe[(qe["Cycle"] == latest) & (qe["QualifierStatus"] == 0)]["EmployeeID"].nunique()
+        # Cycle dates
+        cycle_row = pc[pc["CycleName"] == latest]
+        cutoff_info = ""
+        if not cycle_row.empty:
+            cr = cycle_row.iloc[0]
+            cutoff_info = (f"\nCycle dates: {cr['CycleStartDate'].strftime('%d %b %Y')} — "
+                           f"{cr['CycleEndDate'].strftime('%d %b %Y')}"
+                           f"\nKPI upload cutoff: {cr['CycleUploadCutoffDate'].strftime('%d %b %Y')}")
+        # By scheme
+        by_scheme = cyc.groupby("Scheme").agg(
+            Employees=("EmployeeID","count"),
+            TotalPayout=("TotalCyclePayout","sum"),
+            AvgPayout=("TotalCyclePayout","mean"),
+        ).reset_index().round(2)
+        result_df = _add_names(
+            cyc[["EmployeeID","Scheme","TotalCyclePayout","SchemeMaxPayout","ProrFactor"]].head(50),
+            countries
+        )
+        desc = (
+            f"Cycle: {latest}, Scope: {scope}{cutoff_info}\n"
+            f"Total eligible employees: {len(cyc)}\n"
+            f"Total payout: {total_p:,.2f}\n"
+            f"Average payout as % of max: {avg_pct:.1%}\n"
+            f"Hit max payout: {hit_max} ({hit_max/len(cyc):.1%})\n"
+            f"Qualifier failures: {q_fail}\n"
+            f"Prorated for attendance: {prorat}\n\n"
+            f"By scheme:\n{by_scheme.to_string(index=False)}"
+        )
         return result_df, desc
 
     elif intent == "kpi_trend":
@@ -403,71 +490,80 @@ def retrieve_data(intent: str, countries: list, question: str):
         )
 
     elif intent == "adjustment":
-        fr  = get_flash_reward(countries)
+        adj = get_kpi_adjustment(countries)
+        qa  = get_qualifying_adj(countries)
         fh  = get_flash_home(countries)
-        latest = fr["Cycle"].max()
-        cyc = fr[fr["Cycle"]==latest].copy()
-        cyc_agg = cyc.groupby("EmployeeID").agg(
-            TotalCyclePayout=("TotalCyclePayout","first"),
-            SumMetricPayout=("MetricPayout","sum"),
-            QualifierFailed=("QualifierFailed", lambda x: x.dropna().iloc[0] if len(x.dropna()) else ""),
-            ProrFactor=("ProrFactor","first"),
-            Scheme=("Scheme","first"),
-        ).reset_index()
-        cyc_agg["PayoutDelta"] = (cyc_agg["TotalCyclePayout"] - cyc_agg["SumMetricPayout"]).round(2)
-        adjusted = cyc_agg[cyc_agg["PayoutDelta"].abs() > 0.01].copy()
-        adjusted = _add_names(adjusted, countries)
-        show = [c for c in ["EmployeeID","EmployeeName","Scheme","SumMetricPayout",
-                             "TotalCyclePayout","PayoutDelta","QualifierFailed","ProrFactor"] if c in adjusted.columns]
-        return adjusted, (
-            f"Payout adjustment data for cycle {latest}, scope: {scope}\n"
-            f"PayoutDelta = TotalCyclePayout minus sum of MetricPayouts.\n"
-            f"Full adjustment workflow (KPIAdjustment, ApprovalStatus, RecordedTier) available in real DB.\n"
-            f"Employees with payout delta: {len(adjusted)}\n{adjusted[show].to_string(index=False)}"
+        # KPI adjustments
+        kpi_show = [c for c in ["AdjustmentID","EmployeeID","EmployeeName","Cycle","Metric",
+                                 "Scheme","RecordedKPI","AdjustedKPI","RecordedPayout",
+                                 "AdjustedPayout","RecordedTier","AdjStatus",
+                                 "SubmittedBy","SubmittedDate","ApprovedBy","ApprovedDate"] if c in adj.columns]
+        # Qualifier adjustments
+        qa_show = [c for c in ["QualAdjID","EmployeeID","Cycle","Qualifier","RecordedStatus",
+                                "AdjustedStatus","AdjStatus","ActionBy","ActionDate"] if c in qa.columns]
+        pending_kpi  = adj[adj["AdjStatus"] == "Pending"] if not adj.empty else pd.DataFrame()
+        pending_qual = qa[qa["AdjStatus"] == "Pending"]   if not qa.empty  else pd.DataFrame()
+        desc = (
+            f"Adjustment data, scope: {scope}.\n\n"
+            f"KPI Adjustments — Total: {len(adj)}, "
+            f"Pending: {len(pending_kpi)}, "
+            f"Approved: {len(adj[adj['AdjStatus']=='Approved']) if not adj.empty else 0}, "
+            f"Rejected: {len(adj[adj['AdjStatus']=='Rejected']) if not adj.empty else 0}\n"
+            f"{adj[kpi_show].to_string(index=False) if not adj.empty else 'No KPI adjustments.'}\n\n"
+            f"Qualifier Status Adjustments — Total: {len(qa)}, Pending: {len(pending_qual)}\n"
+            f"{qa[qa_show].to_string(index=False) if not qa.empty else 'No qualifier adjustments.'}"
         )
+        return adj, desc
 
     elif intent == "scheme_config":
-        fr  = get_flash_reward(countries)
-        latest = fr["Cycle"].max()
-        cyc = fr[fr["Cycle"]==latest]
-        scheme_summary = cyc.groupby("Scheme").agg(
-            MaxPayout=("SchemeMaxPayout","first"),
-            ActiveEmployees=("EmployeeID","nunique"),
-            Metrics=("Metric", lambda x: ", ".join(sorted(x.unique()))),
-            AvgAchieved=("Achieved","mean"),
-        ).reset_index().round(2)
-        metric_detail = cyc.groupby(["Scheme","Metric"]).agg(
-            Target=("Target","mean"),
-            AvgAchieved=("Achieved","mean"),
-            TotalMetricPayout=("MetricPayout","sum"),
-        ).reset_index().round(2)
-        return scheme_summary, (
-            f"Incentive scheme configuration for cycle {latest}, scope: {scope}\n\n"
-            f"Scheme summary:\n{scheme_summary.to_string(index=False)}\n\n"
-            f"KPI matrix per scheme:\n{metric_detail.to_string(index=False)}\n\n"
-            f"Note: Tier definitions (IncentiveSchemeTier), KPI weightage (IncentiveMatrix.Weightage), "
-            f"and acknowledgement status (IncentiveSchemeAcknowledgement) are in the real DB schema."
+        scheme   = get_incentive_scheme()
+        tiers    = get_scheme_tier()
+        matrix   = get_incentive_matrix()
+        ack      = get_scheme_ack(countries)
+        fr       = get_flash_reward(countries)
+        latest   = fr["Cycle"].max()
+        cyc      = fr[fr["Cycle"] == latest]
+        # Active employees per scheme
+        emp_by_scheme = cyc.groupby("Scheme")["EmployeeID"].nunique().reset_index(name="ActiveEmployees")
+        # Ack summary
+        ack_summ = ack.groupby(["SchemeName","AckStatus"]).size().reset_index(name="Count") if not ack.empty else pd.DataFrame()
+        desc = (
+            f"Incentive scheme configuration for cycle {latest}, scope: {scope}.\n\n"
+            f"Schemes:\n{scheme[['SchemeName','MaxPayout','StartDate','EndDate','Status']].to_string(index=False)}\n\n"
+            f"Active employees per scheme:\n{emp_by_scheme.to_string(index=False)}\n\n"
+            f"KPI Matrix (metrics + weightage):\n{matrix[['SchemeName','Metric','Weightage']].to_string(index=False)}\n\n"
+            f"Tier structure:\n{tiers[['SchemeName','Tier','TargetMin','TargetMax','PayoutPct','PayoutAmount']].to_string(index=False)}\n\n"
+            f"Acknowledgement status:\n{ack_summ.to_string(index=False) if not ack_summ.empty else 'No ack data.'}"
         )
+        return scheme, desc
 
     elif intent == "login":
-        fh = get_flash_home(countries)
-        cols = [c for c in ["EmployeeID","EmployeeName","Country","Project","EmployeeStatus"] if c in fh.columns]
-        df = fh[cols].copy()
+        log = get_login_audit(countries)
+        fh  = get_flash_home(countries)
+        name_cols = [c for c in ["EmployeeID","EmployeeName","Country","Project",
+                                  "EmployeeStatus","JobTitle"] if c in fh.columns]
+        df = log.merge(fh[name_cols], on="EmployeeID", how="left")
+        show = [c for c in ["EmployeeID","EmployeeName","Country","Project",
+                             "EmployeeStatus","LastLoginDate"] if c in df.columns]
+        df = df[show].sort_values("LastLoginDate", ascending=False)
+        thirty_days_ago = pd.Timestamp.today() - pd.DateOffset(days=30)
+        inactive_logins = df[df["LastLoginDate"] < thirty_days_ago] if "LastLoginDate" in df.columns else pd.DataFrame()
         return df, (
-            f"Login data, scope: {scope}\n"
-            f"Note: Last login timestamps come from LoginAuditLog.LoginDate in the real DB. "
-            f"Mock data does not include login records.\n{df.head(30).to_string(index=False)}"
+            f"Login activity, scope: {scope}. Total employees: {len(df)}\n"
+            f"Not logged in for 30+ days: {len(inactive_logins)}\n"
+            f"{df.to_string(index=False)}"
         )
 
     elif intent == "announcement":
-        fr = get_flash_reward(countries)
+        ann    = get_announcement()
+        fr     = get_flash_reward(countries)
         latest = fr["Cycle"].max()
-        empty_df = pd.DataFrame(columns=["Message","StartDate","EndDate"])
-        return empty_df, (
-            f"Announcements for cycle {latest}, scope: {scope}\n"
-            f"Note: Announcement data is in the Announcement table (Message, StartDate, EndDate, Deleted) "
-            f"in the real DB. Active = StartDate <= today <= EndDate AND Deleted = 0. "
-            f"Mock data does not include announcement records."
+        active = ann[ann["IsActive"] == True] if "IsActive" in ann.columns else ann
+        show   = [c for c in ["AnnouncementID","Message","CycleName","StartDate","EndDate"] if c in active.columns]
+        return active, (
+            f"Announcements, current cycle: {latest}, scope: {scope}.\n"
+            f"Total active announcements: {len(active)}\n"
+            f"{active[show].to_string(index=False)}"
         )
 
     elif intent == "country_compare":
