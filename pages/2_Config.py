@@ -1,6 +1,3 @@
-"""
-pages/2_Config.py  —  Orb v2 Semantic Layer Config
-"""
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -8,6 +5,7 @@ import streamlit as st
 import yaml
 from pathlib import Path
 from semantic import thresholds as get_thresholds, raw_config
+from theme import apply_theme, render_toggle, get_colours, AMBER
 
 st.set_page_config(
     page_title="Orb v2 — Config",
@@ -15,58 +13,30 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-AMBER   = "#D97706"
-AMBERL  = "#FEF3C7"
-BG      = "#F9FAFB"
-CARD    = "#FFFFFF"
-BORDER  = "#E5E7EB"
-TEXT    = "#111827"
-SUBTEXT = "#6B7280"
-SB_BG   = "#111827"
-SB_TEXT = "#F9FAFB"
+# Theme init — must happen before apply_theme
+if "theme_mode" not in st.session_state:
+    st.session_state["theme_mode"] = "light"
 
-st.markdown(f"""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=DM+Mono:wght@400;500&family=Inter:wght@300;400;500;600&display=swap');
-html, body, .stApp {{ background: {BG} !important; color: {TEXT}; }}
-#MainMenu, footer {{ display: none !important; }}
-section[data-testid="stSidebar"] {{ background: {SB_BG} !important; }}
-section[data-testid="stSidebar"] * {{ color: {SB_TEXT} !important; }}
-.block-container {{ padding: 1.5rem 2rem !important; max-width: 100% !important; }}
-.stButton > button {{
-    background: {CARD} !important; border: 1px solid {BORDER} !important;
-    border-radius: 8px !important; color: {SUBTEXT} !important;
-    font-family: 'Inter', sans-serif !important; font-size: 0.82rem !important;
-    font-weight: 500 !important; padding: 6px 14px !important;
-}}
-.stButton > button:hover {{
-    border-color: {AMBER} !important; color: {AMBER} !important; background: {AMBERL} !important;
-}}
-.save-btn > div > button {{
-    background: {AMBER} !important; border: none !important;
-    border-radius: 8px !important; color: #fff !important;
-    font-weight: 600 !important; padding: 8px 20px !important;
-}}
-.save-btn > div > button:hover {{ background: #B45309 !important; }}
-.stTextInput > div > div > input, .stNumberInput > div > div > input {{
-    background: {CARD} !important; border: 1px solid {BORDER} !important;
-    border-radius: 8px !important; color: {TEXT} !important;
-    font-family: 'DM Mono', monospace !important; font-size: 0.84rem !important;
-}}
-.stTextArea > div > div > textarea {{
-    background: {CARD} !important; border: 1px solid {BORDER} !important;
-    border-radius: 8px !important; color: {TEXT} !important;
-    font-family: 'DM Mono', monospace !important; font-size: 0.80rem !important;
-}}
-label {{ font-family: 'Inter', sans-serif !important; color: {SUBTEXT} !important;
-         font-size: 0.76rem !important; font-weight: 600 !important; }}
-</style>
-""", unsafe_allow_html=True)
+apply_theme(page="config")
+
+c = get_colours()
+BG      = c["BG"]
+CARD    = c["CARD"]
+BORDER  = c["BORDER"]
+TEXT    = c["TEXT"]
+SUBTEXT = c["SUBTEXT"]
 
 if not st.session_state.get("authenticated"):
     st.warning("Please sign in to Orb v2 first.")
     st.page_link("app.py", label="Go to Orb v2")
     st.stop()
+
+# ── Sidebar toggle ─────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("<div style='flex:1;min-height:40px;'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='height:1px;background:#1F2937;margin:10px 0;'></div>",
+                unsafe_allow_html=True)
+    render_toggle(key_suffix="config")
 
 YAML_PATH = Path(__file__).parent.parent / "semantic_layer.yaml"
 
