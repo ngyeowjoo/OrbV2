@@ -85,9 +85,9 @@ def _maybe_build_vector_index():
     if vs["fr_indexed"] > 0:
         st.session_state["vector_index_built"] = True
         return
-    # Build it — this is the slow step (model download on first cold start)
-    from data import get_data
-    fh, fr = get_data()
+    from data import get_flash_home, get_flash_reward
+    fh = get_flash_home(["ALL"])
+    fr = get_flash_reward(["ALL"])
     with st.spinner("Building search index… (first load only, ~30s on cold start)"):
         build_index(fh, fr)
     st.session_state["vector_index_built"] = True
