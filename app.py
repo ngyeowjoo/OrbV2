@@ -483,6 +483,11 @@ with chat_col:
                     content_cols = [c1, c2, c3]
 
         # ── Render history ────────────────────────────────────────────────────
+        # Ensure panels list always has one entry per assistant message (pad if needed)
+        n_assistant = sum(1 for m in msgs if m["role"] == "assistant")
+        while len(panels) < n_assistant:
+            panels.append({"chart": None, "df": None, "label": ""})
+
         assistant_idx = 0
         for i, msg in enumerate(msgs):
             if msg["role"] == "user":
@@ -859,9 +864,9 @@ if pending:
              else "Table" if df is not None else "")
     st.session_state["panels"].append({"chart": chart, "df": df, "label": label})
 
-    if chart is not None or df is not None:
-        new_idx = len([m for m in st.session_state["messages"]
-                       if m["role"] == "assistant"]) - 1
+    if chart is not None or (df is not None and isinstance(df, pd.DataFrame) and not df.empty):
+        # Use panels list length directly — panels and assistant messages are always parallel
+        new_idx = len(st.session_state["panels"]) - 1
         open_panel(new_idx)
 
     # Persist after every turn so a chat is never lost
@@ -874,8 +879,12 @@ if pending:
 # ── SIDE PANEL ────────────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 if panel_is_open() and panel_col is not None:
-    idx   = st.session_state["panel_idx"]
-    panel = panels[idx] if idx < len(panels) else {}
+    idx = st.session_state["panel_idx"]
+    # Clamp to valid range — panels list may have grown since open_panel was called
+    if idx >= len(panels):
+        idx = len(panels) - 1
+        st.session_state["panel_idx"] = idx
+    panel = panels[idx] if idx >= 0 and idx < len(panels) else {}
 
     with panel_col:
         st.markdown(f"""
@@ -903,6 +912,16 @@ if panel_is_open() and panel_col is not None:
                 if len(num_cols) > 0:
                     dc[num_cols] = dc[num_cols].round(2)
                 st.dataframe(dc, use_container_width=True, height=280)
+                # Download button
+                csv = dc.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    label="⬇  Download CSV",
+                    data=csv,
+                    file_name=f"orb_export_{panel.get('label','data').replace(' ','_').lower()}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    key=f"dl_csv_{idx}",
+                )
 
         st.markdown("<div style='padding:8px 0 16px;'>", unsafe_allow_html=True)
         if st.button("✕  Close", key="close_panel_btn", use_container_width=True):
