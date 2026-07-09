@@ -204,13 +204,29 @@ def retrieve_data(intent: str, countries: list, question: str):
                     f"{df.to_string(index=False)}")
 
     elif intent == "cross_check":
-        joined = get_joined(countries)
-        latest = joined["Cycle"].max()
-        fr_l   = joined[joined["Cycle"] == latest]
-        base_cols = ["EmployeeID","EmployeeName","Country","LastDate","TotalCyclePayout","Cycle"]
-        avail_cols = [c for c in base_cols if c in fr_l.columns]
-        df     = fr_l[(fr_l["EmployeeStatus"]=="Non-Active") & (fr_l["TotalCyclePayout"]>0)]                    [avail_cols]                    .drop_duplicates("EmployeeID")
-        return df, f"Non-active employees with payouts in latest cycle, scope: {scope}.\n{df.to_string(index=False)}"
+        fr  = get_flash_reward(countries)
+        fh  = get_flash_home(countries)
+        latest = fr["Cycle"].max()
+        cyc    = fr[fr["Cycle"] == latest].drop_duplicates("EmployeeID")
+        # All HR fields merged — so every follow-up (join date, grade, supervisor) is answerable
+        hr_cols = [c for c in ["EmployeeID","EmployeeName","EmployeeStatus","Country","Project",
+                                "JobTitle","EmployeeGrade","EmployeeDepartment",
+                                "JoinDate","LastDate","SupervisorID","PMGMRating"] if c in fh.columns]
+        merged  = cyc.merge(fh[hr_cols], on="EmployeeID", how="left")
+        # Non-active with payouts
+        df = merged[
+            (merged.get("EmployeeStatus", pd.Series(dtype=str)) == "Non-Active") &
+            (merged["TotalCyclePayout"] > 0)
+        ].drop_duplicates("EmployeeID")
+        show = [c for c in ["EmployeeID","EmployeeName","Country","Project","JobTitle",
+                             "EmployeeGrade","JoinDate","LastDate","Scheme",
+                             "TotalCyclePayout","SchemeMaxPayout","PMGMRating"] if c in df.columns]
+        return df, (
+            f"Non-active employees with incentive payouts in cycle {latest}, scope: {scope}.\n"
+            f"Count: {len(df)} employees.\n"
+            f"These employees have a recorded payout despite being Non-Active (LastDate is set).\n"
+            f"{df[show].to_string(index=False)}"
+        )
 
     elif intent == "new_joiner":
         import re as _re
@@ -882,6 +898,7 @@ def call_model(messages, system, model_name):
 def _get_followup_context(countries: list, last_df) -> tuple:
     """
     For follow-up questions, build a rich joined context from Flash Reward + Flash Home.
+    Includes ALL HR fields so follow-ups (join date, supervisor, grade, title) are self-contained.
     Caps at 150 rows sorted by TotalCyclePayout to avoid context-window overflow.
     """
     from data import get_flash_reward, get_flash_home
@@ -889,29 +906,43 @@ def _get_followup_context(countries: list, last_df) -> tuple:
     fh  = get_flash_home(countries)
     latest = fr["Cycle"].max()
     cyc = fr[fr["Cycle"] == latest].drop_duplicates("EmployeeID")
-    name_cols = [c for c in ["EmployeeID","EmployeeName","Country","Project",
-                              "EmployeeStatus","PMGMRating"] if c in fh.columns]
-    joined = cyc.merge(fh[name_cols], on="EmployeeID", how="left")
-    show = [c for c in ["EmployeeID","EmployeeName","Scheme","TotalCyclePayout",
-                         "SchemeMaxPayout","QualifierFailed","ProrFactor",
-                         "Country","Project","PMGMRating","EmployeeStatus"] if c in joined.columns]
+
+    # Include every available HR field — this is what makes follow-ups accurate
+    hr_cols = [c for c in [
+        "EmployeeID","EmployeeName","Country","Project","EmployeeStatus",
+        "PMGMRating","JobTitle","EmployeeGrade","EmployeeDepartment",
+        "JoinDate","LastDate","SupervisorID",
+    ] if c in fh.columns]
+    joined = cyc.merge(fh[hr_cols], on="EmployeeID", how="left")
+
+    show = [c for c in [
+        "EmployeeID","EmployeeName","Scheme","TotalCyclePayout","SchemeMaxPayout",
+        "TierAchieved","QualifierFailed","ProrFactor",
+        "Country","Project","PMGMRating","EmployeeStatus",
+        "JobTitle","EmployeeGrade","EmployeeDepartment","JoinDate","LastDate","SupervisorID",
+    ] if c in joined.columns]
     joined = joined[show]
 
     total_rows = len(joined)
     ROW_CAP    = 150
-    if "TotalCyclePayout" in joined.columns:
-        joined_display = joined.sort_values("TotalCyclePayout", ascending=False).head(ROW_CAP)
-    else:
-        joined_display = joined.head(ROW_CAP)
+    joined_display = (
+        joined.sort_values("TotalCyclePayout", ascending=False).head(ROW_CAP)
+        if "TotalCyclePayout" in joined.columns
+        else joined.head(ROW_CAP)
+    )
 
     cap_note = ""
     if total_rows > ROW_CAP:
         cap_note = (f"\n[Note: {total_rows} employees total — showing top {ROW_CAP} by payout. "
                     f"If asked about a specific employee not shown, state this limitation.]")
 
-    parts = [f"Latest cycle: {latest}. Joined employee payout + HR data "
-             f"({min(total_rows, ROW_CAP)} of {total_rows} employees shown):{cap_note}"]
-    parts.append(joined_display.to_string(index=False))
+    parts = [
+        f"Latest cycle: {latest}. Full employee payout + HR profile "
+        f"({min(total_rows, ROW_CAP)} of {total_rows} employees shown).{cap_note}",
+        "Columns include: name, grade, job title, department, join date, last date, supervisor, "
+        "payout, tier, qualifier status, proration.",
+        joined_display.to_string(index=False),
+    ]
 
     if last_df is not None:
         try:
