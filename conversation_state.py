@@ -114,7 +114,7 @@ def reset_ctx():
 def bump_topic(new_intent: str, topic_summary: str, router_filters: dict):
     """
     Called after each successful turn. Updates topic tracking.
-    If the intent changed significantly, resets turn counter.
+    Clears status filter when moving to a workforce-wide intent.
     """
     _init()
     ctx = st.session_state[_SS_KEY]
@@ -127,6 +127,13 @@ def bump_topic(new_intent: str, topic_summary: str, router_filters: dict):
         "cross_join", "ranking", "anomaly", "cross_check",
         "qualifier", "proration", "new_joiner",
     }
+    # Intents that should never carry a status filter forward
+    _CLEAR_STATUS_INTENTS = {
+        "anomaly", "attainment", "cycle_summary", "ranking",
+        "country_compare", "project_compare", "tenure_compare",
+        "kpi_trend", "pmgm", "underperformance", "headcount",
+        "employee_list", "missing_kpi", "scheme_config",
+    }
 
     prev = ctx["topic_intent"]
     if (prev is not None
@@ -134,12 +141,15 @@ def bump_topic(new_intent: str, topic_summary: str, router_filters: dict):
             and new_intent not in _DETAIL_INTENTS
             and prev not in _DETAIL_INTENTS
             and new_intent in _TOPIC_CHANGE_INTENTS):
-        # Topic shifted to something unrelated — reset turn counter
         ctx["turns_in_topic"] = 0
 
     ctx["topic_intent"]   = new_intent
     ctx["topic_summary"]  = topic_summary
     ctx["turns_in_topic"] = ctx.get("turns_in_topic", 0) + 1
+
+    # Clear status filter for workforce-wide intents — never bleed "Non-Active" into anomaly
+    if new_intent in _CLEAR_STATUS_INTENTS:
+        ctx["active_filters"]["status"] = None
 
     # Merge in filters from router (non-null values only)
     if router_filters:
