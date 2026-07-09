@@ -251,9 +251,19 @@ div[data-baseweb="popover"] li:hover {{
 [data-testid="stMetricValue"] {{ color: {AMBER} !important; font-size: 1.4rem !important; font-weight:700 !important; }}
 
 /* ── Dataframe ── */
-[data-testid="stDataFrame"] {{ border: 1px solid {c["BORDER"]} !important; border-radius: 8px; }}
-[data-testid="stDataFrame"] * {{ color: {c["TEXT"]} !important; background: {c["CARD"]} !important; }}
-.stSpinner > div {{ border-top-color: {AMBER} !important; }}
+[data-testid="stDataFrame"] {{
+    border: 1px solid {c["BORDER"]} !important;
+    border-radius: 8px !important;
+    overflow: hidden !important;
+}}
+/* Target only the outer frame wrapper, not the internal canvas */
+[data-testid="stDataFrame"] > div {{
+    background: {c["CARD"]} !important;
+}}
+/* Dataframe toolbar */
+[data-testid="stDataFrameResizable"] {{
+    background: {c["CARD"]} !important;
+}}
 div[data-testid="stForm"] {{ border: none !important; padding: 0 !important; }}
 
 /* ── Expander ── */
