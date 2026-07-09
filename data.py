@@ -73,12 +73,23 @@ def get_data() -> dict:
 
 # ── COUNTRY-SCOPED ACCESSORS ──────────────────────────────────────────────────
 
+def _normalise_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert pandas StringDtype columns to object — required for st.dataframe compatibility."""
+    for col in df.columns:
+        try:
+            if str(df[col].dtype) in ('string', 'String') or \
+               hasattr(df[col], 'dtype') and 'StringDtype' in str(type(df[col].dtype)):
+                df[col] = df[col].astype(object)
+        except Exception:
+            pass
+    return df
+
 def get_flash_home(countries: list) -> pd.DataFrame:
     d = get_data()
     fh = d["flash_home"].copy()
-    if "ALL" in countries:
-        return fh
-    return fh[fh["Country"].isin(countries)].copy()
+    if "ALL" not in countries:
+        fh = fh[fh["Country"].isin(countries)].copy()
+    return _normalise_dtypes(fh)
 
 def get_flash_reward(countries: list) -> pd.DataFrame:
     d  = get_data()
@@ -87,7 +98,7 @@ def get_flash_reward(countries: list) -> pd.DataFrame:
     if "ALL" not in countries:
         allowed = fh[fh["Country"].isin(countries)]["EmployeeID"]
         fr = fr[fr["EmployeeID"].isin(allowed)]
-    return fr.copy()
+    return _normalise_dtypes(fr.copy())
 
 def get_joined(countries: list) -> pd.DataFrame:
     fh = get_flash_home(countries)
