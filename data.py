@@ -236,11 +236,15 @@ def anomaly_summary(countries):
                 SchemeMaxPayout=("SchemeMaxPayout","first"))
            .reset_index())
     name_cols = [c for c in ["EmployeeID","EmployeeName","Country","PMGMRating",
-                              "Project","JobTitle"] if c in fh.columns]
-    merged = cyc.merge(fh[name_cols], on="EmployeeID", how="inner")
-    merged["PayoutPct"] = merged["TotalCyclePayout"] / merged["SchemeMaxPayout"]
-    top_r  = ["Exceptional","Exceeds Expectations"]
-    bot_r  = ["Below Expectations","Unsatisfactory"]
+                              "Project","JobTitle","EmployeeStatus"] if c in fh.columns]
+    # Use left join so all payout records are kept even if fh row is missing
+    merged = cyc.merge(fh[name_cols], on="EmployeeID", how="left")
+    # Anomaly is a workforce-wide analysis — restrict to Active employees
+    if "EmployeeStatus" in merged.columns:
+        merged = merged[merged["EmployeeStatus"] == "Active"]
+    merged["PayoutPct"] = merged["TotalCyclePayout"] / merged["SchemeMaxPayout"].replace(0, 1)
+    top_r    = ["Exceptional","Exceeds Expectations"]
+    bot_r    = ["Below Expectations","Unsatisfactory"]
     high_low = merged[(merged["PMGMRating"].isin(top_r))  & (merged["PayoutPct"] < 0.5)]
     low_high = merged[(merged["PMGMRating"].isin(bot_r))  & (merged["PayoutPct"] >= 0.95)]
     return high_low, low_high, latest
