@@ -922,10 +922,10 @@ if panel_is_open() and panel_col is not None:
                 Data — {len(df_show)} rows × {len(df_show.columns)} cols</p>
                 """, unsafe_allow_html=True)
                 dc = df_show.copy()
-                # Normalise dtypes — StringDtype silently breaks st.dataframe
+                # Normalise dtypes
                 for col in dc.columns:
                     try:
-                        if str(dc[col].dtype) in ('string', 'StringDtype') or \
+                        if str(dc[col].dtype) in ('string', 'String') or \
                            pd.api.types.is_string_dtype(dc[col]):
                             dc[col] = dc[col].astype(object)
                     except Exception:
@@ -934,7 +934,46 @@ if panel_is_open() and panel_col is not None:
                 num_cols = dc.select_dtypes("number").columns
                 if len(num_cols) > 0:
                     dc[num_cols] = dc[num_cols].round(2)
-                st.dataframe(dc, use_container_width=True, height=min(400, 60 + len(dc) * 35))
+
+                # Render as HTML table — fully theme-controllable, no iframe issues
+                _is_dark = st.session_state.get("theme_mode", "light") == "dark"
+                _tbl_bg   = "#1A1D27" if _is_dark else "#FFFFFF"
+                _hdr_bg   = "#252836" if _is_dark else "#F3F4F6"
+                _row_alt  = "#1F2233" if _is_dark else "#F9FAFB"
+                _txt      = "#E5E7EB" if _is_dark else "#111827"
+                _brd      = "#2D3143" if _is_dark else "#E5E7EB"
+
+                header_html = "".join(
+                    f'<th style="padding:6px 10px;text-align:left;font-size:0.70rem;'
+                    f'font-weight:600;text-transform:uppercase;letter-spacing:0.05em;'
+                    f'white-space:nowrap;border-bottom:2px solid {_brd};'
+                    f'color:{AMBER};">{col}</th>'
+                    for col in dc.columns
+                )
+                rows_html = ""
+                for ri, (_, row) in enumerate(dc.iterrows()):
+                    bg = _row_alt if ri % 2 == 0 else _tbl_bg
+                    cells = "".join(
+                        f'<td style="padding:5px 10px;font-size:0.78rem;white-space:nowrap;'
+                        f'border-bottom:1px solid {_brd};color:{_txt};">{v}</td>'
+                        for v in row.values
+                    )
+                    rows_html += f'<tr style="background:{bg};">{cells}</tr>'
+
+                table_html = f"""
+                <div style="overflow-x:auto;overflow-y:auto;max-height:380px;
+                            border:1px solid {_brd};border-radius:8px;
+                            background:{_tbl_bg};margin-bottom:8px;">
+                  <table style="width:100%;border-collapse:collapse;background:{_tbl_bg};">
+                    <thead style="background:{_hdr_bg};position:sticky;top:0;">
+                      <tr>{header_html}</tr>
+                    </thead>
+                    <tbody>{rows_html}</tbody>
+                  </table>
+                </div>
+                """
+                st.markdown(table_html, unsafe_allow_html=True)
+
                 # Download button
                 try:
                     csv = dc.to_csv(index=False).encode("utf-8")
