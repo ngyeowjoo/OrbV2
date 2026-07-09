@@ -202,7 +202,18 @@ def _regex_fallback(question: str, ctx: dict = None) -> dict:
     }
 
 
-def route(question: str, history: list, last_df_columns: list = None) -> dict:
+def _safe_text(s: str, maxlen: int = 200) -> str:
+    """Strip characters that can break f-string prompt injection."""
+    if not s:
+        return ""
+    # Remove control chars, curly braces (break f-strings), backticks
+    import unicodedata
+    cleaned = "".join(
+        c for c in s
+        if unicodedata.category(c)[0] != "C"   # no control characters
+        and c not in '`{}'
+    )
+    return cleaned[:maxlen]
     """
     Call DeepSeek to classify intent and data needs.
     Injects conversation_state context for multi-turn coherence.
@@ -225,12 +236,12 @@ def route(question: str, history: list, last_df_columns: list = None) -> dict:
             result["reasoning"] = f"Intent hint matched: '{question}' → {forced_intent}"
         return result
 
-    # ── Build conversation snippet (last 6 messages, not 4) ──────────────────
+    # ── Build conversation snippet (last 6 messages) ─────────────────────────
     history_snippet = ""
     if history:
         recent = history[-6:]
         history_snippet = "\n".join(
-            f"{m['role'].upper()}: {m['content'][:150]}" for m in recent
+            f"{m['role'].upper()}: {_safe_text(m['content'], 200)}" for m in recent
         )
 
     last_cols_str = ""
@@ -240,20 +251,21 @@ def route(question: str, history: list, last_df_columns: list = None) -> dict:
     # ── Inject conversation context ───────────────────────────────────────────
     conv_context = ctx_for_router()
 
-    user_prompt = f"""=== CONVERSATION CONTEXT ===
-{conv_context}
+    safe_q         = _safe_text(question, 400)
+    safe_normalised = _safe_text(normalised, 400)
 
-=== RECENT MESSAGES ===
-{history_snippet or "(no prior messages)"}
-{last_cols_str}
-
-=== CURRENT QUESTION ===
-Normalised: {normalised}
-Original:   {question}
-
-Known intents: {", ".join(KNOWN_INTENTS)}
-
-Respond with ONLY the JSON object."""
+    user_prompt = (
+        "=== CONVERSATION CONTEXT ===\n"
+        + conv_context
+        + "\n\n=== RECENT MESSAGES ===\n"
+        + (history_snippet or "(no prior messages)")
+        + last_cols_str
+        + "\n\n=== CURRENT QUESTION ===\n"
+        + f"Normalised: {safe_normalised}\n"
+        + f"Original:   {safe_q}\n\n"
+        + f"Known intents: {', '.join(KNOWN_INTENTS)}\n\n"
+        + "Respond with ONLY the JSON object."
+    )
 
     try:
         r = requests.post(
