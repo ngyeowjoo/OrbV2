@@ -191,17 +191,26 @@ def retrieve_data(intent: str, countries: list, question: str):
 
     elif intent == "anomaly":
         from semantic import get_threshold
+        # Anomaly is always run across the full active workforce —
+        # never inherits status="Non-Active" from a prior cross_check turn.
+        # Pass the base country list, not scoped_countries which may have a status filter.
         high_low, low_high, cycle = anomaly_summary(countries)
+        total = len(high_low) + len(low_high)
         df = pd.concat([
             high_low.assign(AnomalyType="High PMGM / Low Payout"),
             low_high.assign(AnomalyType="Low PMGM / High Payout"),
-        ])
-        df = _add_names(df, countries)
-        low_pct = get_threshold("anomaly_high_pmgm_low_payout_pct", 50)
+        ], ignore_index=True) if total > 0 else pd.DataFrame()
+        df = _add_names(df, countries) if not df.empty else df
+        low_pct  = get_threshold("anomaly_high_pmgm_low_payout_pct", 50)
         high_pct = get_threshold("anomaly_low_pmgm_high_payout_pct", 95)
-        return df, (f"Performance vs payout anomaly for cycle {cycle}, scope: {scope}.\n"
-                    f"High PMGM + payout < {low_pct}% of max, or Low PMGM + payout >= {high_pct}% of max.\n"
-                    f"{df.to_string(index=False)}")
+        return df, (
+            f"PMGM vs payout anomaly for cycle {cycle}, scope: {scope} (Active employees only).\n"
+            f"Criteria: High PMGM rating (Exceptional / Exceeds) + payout < {low_pct}% of max, "
+            f"OR Low PMGM rating (Below / Unsatisfactory) + payout >= {high_pct}% of max.\n"
+            f"High PMGM / Low Payout: {len(high_low)} employees\n"
+            f"Low PMGM / High Payout: {len(low_high)} employees\n"
+            f"{df.to_string(index=False) if not df.empty else 'No anomalies found under current thresholds.'}"
+        )
 
     elif intent == "cross_check":
         fr  = get_flash_reward(countries)
@@ -1068,12 +1077,20 @@ def answer(question: str, history: list, user: dict,
         df, data_context = retrieve_data(intent, scoped_countries, question)
         chart = build_chart(intent, df)
 
-    # Apply scheme / status filter
+    # Apply scheme / status filter — only for intents where explicit filtering is appropriate.
+    # Never filter by status on workforce-wide analysis intents (anomaly, attainment, etc.)
+    _STATUS_FILTER_BLOCKED = {
+        "anomaly", "attainment", "cycle_summary", "ranking",
+        "country_compare", "project_compare", "tenure_compare",
+        "kpi_trend", "pmgm", "underperformance",
+    }
     if df is not None and not df.empty:
         if filters.get("scheme") and "Scheme" in df.columns:
             df = df[df["Scheme"].str.lower() == filters["scheme"].lower()]
             data_context += f"\n[Filtered to scheme: {filters['scheme']}]"
-        if filters.get("status") and "EmployeeStatus" in df.columns:
+        if (filters.get("status")
+                and "EmployeeStatus" in df.columns
+                and intent not in _STATUS_FILTER_BLOCKED):
             df = df[df["EmployeeStatus"] == filters["status"]]
             data_context += f"\n[Filtered to status: {filters['status']}]"
 
