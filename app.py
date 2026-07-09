@@ -862,10 +862,23 @@ if pending:
     label = ("Chart & Table" if chart is not None and df is not None
              else "Chart" if chart is not None
              else "Table" if df is not None else "")
-    st.session_state["panels"].append({"chart": chart, "df": df, "label": label})
 
-    if chart is not None or (df is not None and isinstance(df, pd.DataFrame) and not df.empty):
-        # Use panels list length directly — panels and assistant messages are always parallel
+    # Normalise df: convert pandas StringDtype → object so st.dataframe renders correctly
+    # Also convert datetime columns to str to survive JSON round-trip in chat_store
+    if df is not None and isinstance(df, pd.DataFrame) and not df.empty:
+        df_stored = df.copy()
+        for col in df_stored.columns:
+            if pd.api.types.is_string_dtype(df_stored[col]) or \
+               hasattr(df_stored[col], 'dtype') and str(df_stored[col].dtype) == 'string':
+                df_stored[col] = df_stored[col].astype(object)
+            elif pd.api.types.is_datetime64_any_dtype(df_stored[col]):
+                df_stored[col] = df_stored[col].astype(str)
+    else:
+        df_stored = df
+
+    st.session_state["panels"].append({"chart": chart, "df": df_stored, "label": label})
+
+    if chart is not None or (df_stored is not None and isinstance(df_stored, pd.DataFrame) and not df_stored.empty):
         new_idx = len(st.session_state["panels"]) - 1
         open_panel(new_idx)
 
@@ -905,23 +918,36 @@ if panel_is_open() and panel_col is not None:
             if isinstance(df_show, pd.DataFrame) and not df_show.empty:
                 st.markdown(f"""
                 <p style="font-family:'DM Mono',monospace;font-size:0.60rem;
-                           text-transform:uppercase;color:{SUBTEXT};padding:4px 0 4px 2px;">Data</p>
+                           text-transform:uppercase;color:{SUBTEXT};padding:4px 0 4px 2px;">
+                Data — {len(df_show)} rows × {len(df_show.columns)} cols</p>
                 """, unsafe_allow_html=True)
                 dc = df_show.copy()
+                # Normalise dtypes — StringDtype silently breaks st.dataframe
+                for col in dc.columns:
+                    try:
+                        if str(dc[col].dtype) in ('string', 'StringDtype') or \
+                           pd.api.types.is_string_dtype(dc[col]):
+                            dc[col] = dc[col].astype(object)
+                    except Exception:
+                        pass
+                # Round numerics
                 num_cols = dc.select_dtypes("number").columns
                 if len(num_cols) > 0:
                     dc[num_cols] = dc[num_cols].round(2)
-                st.dataframe(dc, use_container_width=True, height=280)
+                st.dataframe(dc, use_container_width=True, height=min(400, 60 + len(dc) * 35))
                 # Download button
-                csv = dc.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    label="⬇  Download CSV",
-                    data=csv,
-                    file_name=f"orb_export_{panel.get('label','data').replace(' ','_').lower()}.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                    key=f"dl_csv_{idx}",
-                )
+                try:
+                    csv = dc.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        label="⬇  Download CSV",
+                        data=csv,
+                        file_name=f"orb_{panel.get('label','data').replace(' ','_').lower()}.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                        key=f"dl_csv_{idx}",
+                    )
+                except Exception:
+                    pass
 
         st.markdown("<div style='padding:8px 0 16px;'>", unsafe_allow_html=True)
         if st.button("✕  Close", key="close_panel_btn", use_container_width=True):
