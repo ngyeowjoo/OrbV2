@@ -60,11 +60,13 @@ def log_interaction(
     vector_docs:    list = None,
     latency_ms:     dict = None,
     max_tokens:     int  = None,
+    rewritten_q:    str  = None,
 ):
     """Append one interaction. Newest entry first. Max MAX_ENTRIES kept."""
     entry = {
         "ts":             datetime.now().strftime("%H:%M:%S"),
         "question":       question,
+        "rewritten_q":    rewritten_q,
         "routing":        routing,
         "retrieval_mode": retrieval_mode,
         "intent":         intent,
