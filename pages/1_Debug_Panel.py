@@ -215,6 +215,11 @@ else:
                     {reason}
                 </div>""", unsafe_allow_html=True)
 
+                rewritten = entry.get("rewritten_q")
+                if rewritten:
+                    st.markdown(f'<p style="font-family:DM Mono,monospace;font-size:0.68rem;text-transform:uppercase;color:{SUBTEXT};margin:12px 0 4px;">Query Rewriter Output</p>', unsafe_allow_html=True)
+                    st.info(f"Original question rewritten to: **{rewritten}**")
+
             with tabs[1]:
                 conv_ctx = entry.get("conv_context") or entry.get("routing", {}).get("reasoning", "")
                 if conv_ctx:
