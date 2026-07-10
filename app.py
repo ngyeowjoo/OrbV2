@@ -852,6 +852,7 @@ if pending:
             system_prompt  = debug_info.get("system_prompt", ""),
             ai_response    = text,
             max_tokens     = debug_info.get("max_tokens"),
+            rewritten_q    = debug_info.get("rewritten_q"),
         )
     except Exception:
         pass   # never crash the main app over debug logging
