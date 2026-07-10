@@ -906,22 +906,63 @@ def call_model(messages, system, model_name):
 
 def _get_followup_context(countries: list, last_df) -> tuple:
     """
-    For follow-up questions, build a rich joined context from Flash Reward + Flash Home.
-    Includes ALL HR fields so follow-ups (join date, supervisor, grade, title) are self-contained.
-    Caps at 150 rows sorted by TotalCyclePayout to avoid context-window overflow.
+    Idea 1: last_df-first follow-up context.
+
+    Priority order:
+    1. If last_df has EmployeeID — enrich it with ALL HR + reward fields and use it.
+       This keeps the AI focused on exactly the employees from the prior result.
+    2. Fallback: fetch latest cycle company-wide (capped at 150 rows).
+
+    This prevents "why are you talking about 150 random employees when I asked about
+    the 7 anomaly employees from the previous answer?"
     """
     from data import get_flash_reward, get_flash_home
     fr  = get_flash_reward(countries)
     fh  = get_flash_home(countries)
     latest = fr["Cycle"].max()
-    cyc = fr[fr["Cycle"] == latest].drop_duplicates("EmployeeID")
 
-    # Include every available HR field — this is what makes follow-ups accurate
     hr_cols = [c for c in [
         "EmployeeID","EmployeeName","Country","Project","EmployeeStatus",
         "PMGMRating","JobTitle","EmployeeGrade","EmployeeDepartment",
         "JoinDate","LastDate","SupervisorID",
     ] if c in fh.columns]
+
+    reward_cols = [c for c in [
+        "EmployeeID","Scheme","SchemeMaxPayout","TotalCyclePayout",
+        "TierAchieved","QualifierFailed","ProrFactor","PayoutEarned",
+    ] if c in fr.columns]
+
+    # ── PATH 1: Enrich last_df with any missing HR and reward fields ───────────
+    if last_df is not None and "EmployeeID" in last_df.columns and not last_df.empty:
+        context_df = last_df.copy()
+
+        # Merge in HR fields not already in last_df
+        missing_hr = [c for c in hr_cols if c not in context_df.columns]
+        if missing_hr:
+            context_df = context_df.merge(
+                fh[["EmployeeID"] + missing_hr], on="EmployeeID", how="left"
+            )
+
+        # Merge in reward fields from latest cycle not already present
+        missing_rew = [c for c in reward_cols if c not in context_df.columns]
+        if missing_rew:
+            cyc_latest = (fr[fr["Cycle"] == latest]
+                          .drop_duplicates("EmployeeID")
+                          [["EmployeeID"] + missing_rew])
+            context_df = context_df.merge(cyc_latest, on="EmployeeID", how="left")
+
+        n = len(context_df)
+        desc = (
+            f"FOLLOW-UP CONTEXT — {n} employee(s) from the previous result.\n"
+            f"These are the SPECIFIC employees the user is asking about. "
+            f"Answer only from this set unless the user explicitly asks to broaden scope.\n"
+            f"Cycle: {latest}. Columns: {', '.join(context_df.columns.tolist())}\n"
+            f"{context_df.to_string(index=False)}"
+        )
+        return context_df, desc
+
+    # ── PATH 2: No last_df — fetch company-wide latest cycle ──────────────────
+    cyc = fr[fr["Cycle"] == latest].drop_duplicates("EmployeeID")
     joined = cyc.merge(fh[hr_cols], on="EmployeeID", how="left")
 
     show = [c for c in [
@@ -936,30 +977,114 @@ def _get_followup_context(countries: list, last_df) -> tuple:
     ROW_CAP    = 150
     joined_display = (
         joined.sort_values("TotalCyclePayout", ascending=False).head(ROW_CAP)
-        if "TotalCyclePayout" in joined.columns
-        else joined.head(ROW_CAP)
+        if "TotalCyclePayout" in joined.columns else joined.head(ROW_CAP)
     )
 
     cap_note = ""
     if total_rows > ROW_CAP:
-        cap_note = (f"\n[Note: {total_rows} employees total — showing top {ROW_CAP} by payout. "
-                    f"If asked about a specific employee not shown, state this limitation.]")
+        cap_note = (
+            f"\n[{total_rows} employees total — showing top {ROW_CAP} by payout. "
+            f"If the user asks about a specific employee not shown, state this limitation.]"
+        )
 
-    parts = [
-        f"Latest cycle: {latest}. Full employee payout + HR profile "
-        f"({min(total_rows, ROW_CAP)} of {total_rows} employees shown).{cap_note}",
-        "Columns include: name, grade, job title, department, join date, last date, supervisor, "
-        "payout, tier, qualifier status, proration.",
-        joined_display.to_string(index=False),
-    ]
+    desc = (
+        f"FOLLOW-UP CONTEXT — company-wide latest cycle ({latest}). "
+        f"{min(total_rows, ROW_CAP)} of {total_rows} employees shown.{cap_note}\n"
+        f"Columns: {', '.join(joined_display.columns.tolist())}\n"
+        f"{joined_display.to_string(index=False)}"
+    )
+    return joined, desc
 
-    if last_df is not None:
-        try:
-            parts.append(f"\nPrevious query result for reference:\n{last_df.head(50).to_string(index=False)}")
-        except Exception:
-            pass
 
-    return joined, "\n".join(parts)
+def rewrite_followup_question(question: str, history: list,
+                              last_df, model_name: str) -> str:
+    """
+    Idea 2: Query rewriting for follow-ups.
+
+    Resolves pronouns (they/them/that employee/those) into specific names/IDs
+    using the conversation history and last_df as grounding.
+
+    Only fires when:
+    - Question is short (≤10 words) — longer questions are usually already specific
+    - Question contains a pronoun or reference word
+    - There is prior conversation history to resolve from
+
+    Validation: the rewritten question must contain a name or ID that actually
+    appears in last_df (or history) — otherwise return original to avoid hallucination.
+    """
+    import re as _re
+
+    PRONOUN_PATTERN = _re.compile(
+        r"\b(they|them|their|those|these|that employee|that person|"
+        r"that one|this employee|the same|who are they|who is that)\b",
+        _re.IGNORECASE
+    )
+
+    words = question.split()
+    if len(words) > 10:
+        return question
+    if not PRONOUN_PATTERN.search(question):
+        return question
+    if not history:
+        return question
+
+    # Build grounding: names and IDs from last_df
+    known_names = set()
+    known_ids   = set()
+    if last_df is not None and not last_df.empty:
+        if "EmployeeName" in last_df.columns:
+            known_names = set(last_df["EmployeeName"].dropna().tolist())
+        if "EmployeeID" in last_df.columns:
+            known_ids = set(last_df["EmployeeID"].dropna().tolist())
+
+    # Also pull names/IDs mentioned in last assistant message
+    last_assistant = next(
+        (m["content"] for m in reversed(history) if m["role"] == "assistant"), ""
+    )
+
+    rewrite_system = (
+        "You are a query rewriter for a workforce analytics assistant. "
+        "The user asked a follow-up question with a pronoun. "
+        "Using the conversation history, rewrite it as a standalone question "
+        "that names the specific employee(s) or group being referenced. "
+        "Output ONLY the rewritten question — no explanation, no prefix."
+    )
+
+    history_excerpt = "\n".join(
+        f"{m['role'].upper()}: {m['content'][:300]}"
+        for m in history[-4:]
+    )
+    rewrite_prompt = (
+        f"Conversation so far:\n{history_excerpt}\n\n"
+        f"Follow-up question to rewrite: {question}\n\n"
+        f"Rewritten standalone question:"
+    )
+
+    try:
+        rewritten = call_model(
+            [{"role": "user", "content": rewrite_prompt}],
+            rewrite_system,
+            model_name,
+        ).strip().strip('"').strip("'")
+
+        if not rewritten or len(rewritten) < 5:
+            return question
+
+        # Validation: rewritten question must mention a name/ID we know about,
+        # or reference something from the last assistant message.
+        # This prevents the rewriter from hallucinating a wrong employee.
+        rewritten_lower = rewritten.lower()
+        has_known_ref = (
+            any(n.lower() in rewritten_lower for n in known_names if n)
+            or any(i.lower() in rewritten_lower for i in known_ids if i)
+            or any(w.lower() in rewritten_lower for w in last_assistant.split()
+                   if len(w) > 4 and w[0].isupper())  # proper nouns from assistant
+        )
+
+        return rewritten if has_known_ref else question
+
+    except Exception:
+        return question
 
 
 # ── MAIN ENTRY POINT ──────────────────────────────────────────────────────────
@@ -988,9 +1113,17 @@ def answer(question: str, history: list, user: dict,
 
     normalised_q = normalise(question)
 
+    # ── Idea 2 & 3: Rewrite follow-up questions before routing ───────────────
+    # Short pronoun-heavy questions ("when did they join?") get resolved into
+    # specific questions ("when did Jian Patel join?") before the router sees them.
+    # The original question is kept for display; only routing/retrieval uses rewritten.
+    rewritten_q = rewrite_followup_question(question, history, last_df, model_name)
+    route_q     = rewritten_q  # what the router and retrieve_data receive
+    display_q   = question     # what appears in chat and debug panel
+
     # ── Step 1: AI Router ────────────────────────────────────────────────────
     last_df_cols = list(last_df.columns) if last_df is not None else []
-    routing = route(normalised_q, history, last_df_cols)
+    routing = route(normalise(route_q), history, last_df_cols)
 
     intent        = routing.get("intent", "free_form")
     needs_fresh   = routing.get("needs_fresh_join", False)
@@ -1046,15 +1179,13 @@ def answer(question: str, history: list, user: dict,
             df, data_context = _get_followup_context(scoped_countries, last_df)
             chart = None
         except Exception:
-            df, data_context = retrieve_data(intent, scoped_countries, question)
+            df, data_context = retrieve_data(intent, scoped_countries, route_q)
             chart = build_chart(intent, df)
 
     elif intent == "free_form" and not use_vector:
-        # Double-fetch: cycle_summary + anomaly gives the AI real numbers
-        # to work with instead of guessing from 10 sample rows.
         try:
-            df_sum,  ctx_sum  = retrieve_data("cycle_summary", scoped_countries, question)
-            df_anom, ctx_anom = retrieve_data("anomaly",       scoped_countries, question)
+            df_sum,  ctx_sum  = retrieve_data("cycle_summary", scoped_countries, route_q)
+            df_anom, ctx_anom = retrieve_data("anomaly",       scoped_countries, route_q)
             df = df_sum
             data_context = (
                 "[Free-form — combined cycle summary + anomaly context]\n"
@@ -1062,19 +1193,19 @@ def answer(question: str, history: list, user: dict,
             )
             chart = build_chart("cycle_summary", df_sum)
         except Exception:
-            df, data_context = retrieve_data("free_form", scoped_countries, question)
+            df, data_context = retrieve_data("free_form", scoped_countries, route_q)
             chart = None
 
     elif use_vector:
         country_filter = None if "ALL" in scoped_countries else scoped_countries
         df, data_context = vector_retrieve(
-            question, top_k=30, source="both", country_filter=country_filter
+            route_q, top_k=30, source="both", country_filter=country_filter
         )
         chart = build_chart(intent, df) if df is not None and not df.empty else None
         data_context = f"[Semantic retrieval — top relevant records]\n{data_context}"
 
     else:
-        df, data_context = retrieve_data(intent, scoped_countries, question)
+        df, data_context = retrieve_data(intent, scoped_countries, route_q)
         chart = build_chart(intent, df)
 
     # Apply scheme / status filter — only for intents where explicit filtering is appropriate.
@@ -1147,6 +1278,47 @@ def answer(question: str, history: list, user: dict,
     conv_context_block = ctx_for_ai()
     conv_section = f"\nConversation context:\n{conv_context_block}\n" if conv_context_block else ""
 
+    # ── Idea 4: Grounding block — tell AI exactly what data it has ───────────
+    if df is not None and isinstance(df, pd.DataFrame) and not df.empty:
+        grounding_block = (
+            f"\nDATA GROUNDING:\n"
+            f"  Rows returned: {len(df)}\n"
+            f"  Columns available: {', '.join(df.columns.tolist())}\n"
+            f"  Answer ONLY using values from these columns. "
+            f"  If a field is not in this list, say it is not in the current result.\n"
+        )
+        if rewritten_q != display_q:
+            grounding_block += f"  [Question was internally resolved to: {rewritten_q}]\n"
+    else:
+        grounding_block = "\nDATA GROUNDING: No data rows returned for this query.\n"
+
+    # ── Idea 5: Intent-specific answer format ─────────────────────────────────
+    _FORMAT_HINTS = {
+        "attainment":       "State the % hitting max, total payout, then list the top flagged names.",
+        "underperformance": "List each employee with name, consecutive miss count, country, and project.",
+        "anomaly":          "Group into two sections: (1) High rating / low payout, (2) Low rating / high payout. Name each employee.",
+        "qualifier":        "State total failures, break down by qualifier type, then name the employees.",
+        "proration":        "State how many were prorated, average factor, then list affected employees with days worked.",
+        "ranking":          "Numbered list with name, payout amount, and % of max. Most/least first.",
+        "cross_check":      "List each non-active employee with their name, last date, country, and payout amount.",
+        "cycle_summary":    "Lead with cycle period, total payout, % hitting max, qualifier failures, then by-scheme breakdown.",
+        "kpi_trend":        "Show cycle-by-cycle progression with numbers. Note direction of trend (improving/declining).",
+        "project_compare":  "Ranked table: project, avg payout, employee count, qualifier failures. Highlight best and worst.",
+        "country_compare":  "Ranked table: country, avg payout, employee count. Highlight gaps.",
+        "tenure_compare":   "Table by tenure band with avg payout. State whether tenure correlates with payout.",
+        "adjustment":       "State pending count, approved count, rejected count. List pending items with employee name and delta.",
+        "scheme_config":    "List each scheme's tiers, max payout, KPI metrics and weightage, acknowledgement status.",
+        "missing_kpi":      "List each missing employee with name, project, country, and last known scheme.",
+        "headcount":        "Total count first, then breakdown by country/project/status table.",
+        "attrition":        "Total leavers, by country and year, flag any with active payouts.",
+        "pmgm":             "Distribution table (Exceptional → Unsatisfactory) with counts and % for each rating.",
+        "employee_list":    "Table with name, grade, title, department, country, project, join date.",
+        "cross_join":       "Answer the specific HR question directly using the employee data in context.",
+        "login":            "List employees, their last login date, and flag anyone not logged in for 30+ days.",
+        "announcement":     "List each announcement with message, active cycle, and date range.",
+    }
+    format_hint = _FORMAT_HINTS.get(intent, "Answer concisely with specific numbers from the data.")
+
     system = f"""You are the Orb v2 AI assistant — an executive-grade workforce intelligence analyst.
 You are answering a {role} named {user["display_name"]}.
 Their data scope: {scope}.
@@ -1155,11 +1327,11 @@ Data sources:
   TierAchieved, MetricPayout, QualifierFailed, ProrationType, ProrFactor, PayoutEarned, TotalCyclePayout
 - Flash Home: EmployeeID, EmployeeName, EmployeeStatus, JoinDate, LastDate, Country, Project,
   PMGMRating, JobTitle, EmployeeGrade, EmployeeDepartment, SupervisorID
-- Supporting tables: payout_cycle (cycle dates, KPI cutoff), scheme_tier (tier thresholds),
-  incentive_matrix (KPI weightage), scheme_acknowledgement, kpi_adjustment, qualifying_employee,
-  login_audit (LastLoginDate), announcement, attendance (DaysWorked, ProrationFactor)
+- Supporting tables: payout_cycle, scheme_tier, incentive_matrix, scheme_acknowledgement,
+  kpi_adjustment, qualifying_employee, login_audit, announcement, attendance
 Today: {pd.Timestamp.today().strftime("%d %b %Y")}. Model: {model_name}.
-Query intent: {intent}. Follow-up: {is_followup}. Router: {router_reason}
+Query intent: {intent}. Follow-up: {is_followup}. Rewritten: {rewritten_q != display_q}.
+{grounding_block}
 {conv_section}
 {threshold_rules}
 
@@ -1167,18 +1339,27 @@ Response style for this user:
 {role_instruction}
 {list_depth}
 
-Rules:
-- Lead with the insight, not the method. Never open with "Based on the data..."
-- ALL employee HR fields are available in the data context below — JoinDate, LastDate,
-  JobTitle, EmployeeGrade, EmployeeDepartment, SupervisorID are always present in joined results.
-  NEVER say these fields are unavailable. Look for them in the data context.
-- Quote specific numbers — never be vague when the data has them.
+ANTI-HALLUCINATION RULES — these are non-negotiable:
+- Only state facts that appear in the Data Context below. Never infer, estimate, or fill gaps.
+- If a specific field (e.g. JoinDate, SupervisorID) is in the COLUMNS AVAILABLE list above
+  but not visible for a specific employee, say "not recorded" — do not fabricate a value.
+- If a field is NOT in the columns list, say "that field is not in the current result"
+  and suggest the user ask a more specific question to retrieve it.
+- Never say an employee "likely" or "probably" has a value — only state what is in the data.
+- Never round or approximate a number that is given exactly in the data.
+- If the data has 0 rows, say exactly that and do not attempt to answer from memory.
+- Do not carry over specific numbers, names, or dates from prior turns unless they appear
+  in the current data context.
+
+ANSWER FORMAT for this query type ({intent}):
+{format_hint}
+
+GENERAL RULES:
+- Lead with the insight. Never open with "Based on the data..." or "According to..."
 - Refer to employees by name. Add ID in brackets only when role is HR.
 - Do NOT use markdown bold (**) or italic (*) formatting.
-- Do NOT mention SQL, dataframes, router, semantic layer, or technical details.
-- Always state the data scope and cycle period you are referencing.
-- For follow-up questions: the full joined dataset is in context — use it directly.
-- If active filters are in the conversation context, apply them unless the user changed them.{chart_note}{empty_note}
+- Do NOT mention SQL, dataframes, router, or any internal technical details.
+- Always state the cycle period and scope you are referencing.{chart_note}{empty_note}
 
 Data context:
 {data_context}
@@ -1206,8 +1387,10 @@ Data context:
         "system_prompt":  system,
         "conv_context":   conv_context_block,
         "max_tokens":     max_tokens,
+        "rewritten_q":    rewritten_q if rewritten_q != display_q else None,
     }
 
-    messages = history[-14:] + [{"role": "user", "content": question}]
+    # Use original question in history so conversation reads naturally
+    messages = history[-14:] + [{"role": "user", "content": display_q}]
     stream   = stream_model(messages, system, model_name, max_tokens)
     return stream, chart, df, debug_info
