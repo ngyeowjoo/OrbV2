@@ -128,14 +128,24 @@ def hint_intent(text: str) -> str | None:
     """
     Check intent_hints for a forced intent match.
     Returns the intent name if found, else None.
-    Used as a pre-check before regex patterns.
+
+    Matching is word-boundary safe (a phrase must match whole words, not just
+    appear as a raw substring) and picks the LONGEST matching phrase across
+    all intents, so a short generic phrase (e.g. "trend") can't win over a
+    more specific one (e.g. "payout history") just because of dict order.
+    This is treated as a *signal*, not an automatic override — see router.py
+    for how it's actually applied.
     """
     t_lower = text.lower()
+    best_intent, best_len = None, 0
     for intent, phrases in intent_hints().items():
         for phrase in (phrases or []):
-            if phrase.lower() in t_lower:
-                return intent
-    return None
+            p = phrase.lower().strip()
+            if not p:
+                continue
+            if re.search(rf"(?<!\w){re.escape(p)}(?!\w)", t_lower) and len(p) > best_len:
+                best_intent, best_len = intent, len(p)
+    return best_intent
 
 def threshold_summary_for_prompt() -> str:
     """
