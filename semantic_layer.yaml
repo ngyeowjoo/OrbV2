@@ -185,102 +185,6 @@ thresholds:
   # Country / scope
   global_scope_keyword: ALL       # sentinel value for global access
 
-  tier:
-    - tier achieved
-    - payout tier
-    - incentive tier
-    - which tier
-    - tier level
-    - tier reached
-    - tier attained
-
-  kpi_trend:
-    - kpi over time
-    - performance over time
-    - payout history
-    - trend over cycles
-    - trend across cycles
-    - performance trend
-    - over the last N cycles
-    - over the last N months
-    - historical performance
-    - payout over time
-    - proration trend
-    - attendance trend
-
-  project_compare:
-    - compare projects
-    - project vs project
-    - by project
-    - per project
-    - across projects
-    - project breakdown
-    - project performance
-    - compare sites
-
-  tenure_compare:
-    - by tenure
-    - tenure band
-    - tenure group
-    - years of service
-    - long tenured
-    - short tenured
-    - employees with X years
-    - compare tenure
-    - tenure vs payout
-    - tenure cohort
-
-  missing_kpi:
-    - no kpi uploaded
-    - kpi not uploaded
-    - missing kpi
-    - kpi not submitted
-    - no data this cycle
-    - not in the system this cycle
-    - haven't uploaded
-    - kpi gap
-    - no performance data
-
-  adjustment:
-    - kpi adjustment
-    - adjusted kpi
-    - adjustment made
-    - kpi changed
-    - modified kpi
-    - override
-    - pending adjustment
-    - approved adjustment
-    - rejected adjustment
-    - adjustment status
-
-  scheme_config:
-    - scheme details
-    - scheme tiers
-    - kpi weightage
-    - kpi weight
-    - scheme structure
-    - incentive structure
-    - scheme configuration
-    - how is the scheme set up
-    - scheme acknowledgement
-    - acknowledged scheme
-    - scheme expiry
-    - scheme end date
-    - when does scheme end
-
-  login:
-    - last login
-    - last logged in
-    - when did employee log in
-    - login activity
-    - login history
-
-  announcement:
-    - announcement
-    - announcements active
-    - notice
-    - notices
-
 # ── FIELD ALIASES (updated with real schema columns) ──────────────────────────
 # Maps user-facing terms to actual column names in the data.
 # Used in filter extraction and display.
@@ -399,6 +303,7 @@ intent_hints:
     - attendance trend
     - historical kpi
     - kpi history
+    - historical performance
     - trend for employee
 
   project_compare:
@@ -410,14 +315,19 @@ intent_hints:
     - across projects
     - project level
     - which project performs
+    - project performance
+    - compare sites
 
   tenure_compare:
     - by tenure
     - tenure band
     - tenure cohort
+    - tenure group
+    - short tenured
     - years of service
     - long tenured vs short
     - compared by tenure
+    - tenure vs payout
     - X years vs Y years
 
   missing_kpi:
@@ -426,6 +336,8 @@ intent_hints:
     - missing kpi
     - not in system
     - no performance data
+    - no data this cycle
+    - haven't uploaded
     - kpi gap
     - haven't submitted kpi
     - scheme but no kpi
@@ -434,26 +346,41 @@ intent_hints:
     - kpi adjustment
     - pending adjustment
     - approved adjustment
+    - rejected adjustment
     - adjustment status
+    - adjustment made
     - adjusted kpi
+    - kpi changed
+    - modified kpi
     - kpi override
     - qualifying status adjustment
 
   scheme_config:
     - scheme tiers
+    - scheme details
     - kpi weightage
     - how is the scheme
     - scheme structure
+    - incentive structure
     - scheme configuration
     - acknowledged scheme
     - scheme acknowledgement
     - scheme expiry
+    - scheme end date
     - when does scheme end
 
   login:
     - last login
     - last logged in
+    - when did employee log in
     - login activity
+    - login history
+
+  announcement:
+    - active announcement
+    - announcements active
+    - announcement for this cycle
+    - any announcements
 
   cross_join:
     - tell me who they are
