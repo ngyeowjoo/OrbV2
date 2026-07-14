@@ -75,6 +75,15 @@ def _mentions_time(q: str) -> bool:
 def _is_comparison(q: str) -> bool:
     return bool(re.search(r"\b(compare|vs|versus|against|difference)\b", q, re.IGNORECASE))
 
+def _mentions_anomaly_direction(q: str) -> bool:
+    """True if the question already specifies which anomaly direction it wants,
+    so we don't ask a question the user effectively already answered."""
+    return bool(re.search(
+        r"\b(high.{0,40}low|low.{0,40}high|both direction|either direction|"
+        r"underpaid|overpaid|under.?paid|over.?paid)\b",
+        q, re.IGNORECASE
+    ))
+
 
 # ── CORE DECISION FUNCTION ────────────────────────────────────────────────────
 
@@ -156,8 +165,7 @@ def needs_clarification(
     _COUNTRY_SENSITIVE = {"ranking", "anomaly", "underperformance", "qualifier", "cross_check"}
     if (intent in _COUNTRY_SENSITIVE
             and has_multi
-            and not _mentions_country(q_lower)
-            and is_short):
+            and not _mentions_country(q_lower)):
         if "ALL" in countries:
             scope_options = [
                 ClarificationOption("Global (all countries)", f"{question} — across all countries"),
@@ -193,7 +201,7 @@ def needs_clarification(
         )
 
     # ── RULE 6: Anomaly — which direction? ───────────────────────────────────
-    if intent == "anomaly" and is_short:
+    if intent == "anomaly" and not _mentions_anomaly_direction(q_lower):
         return True, ClarificationRequest(
             question="Which type of anomaly are you looking for?",
             options=[
