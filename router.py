@@ -142,6 +142,19 @@ def _safe(s: str, maxlen: int = 300) -> str:
     )[:maxlen]
 
 
+def _recompute_derived_flags(result: dict, intent: str, is_followup: bool) -> None:
+    """
+    Recompute needs_fresh_join / needs_flash_reward / needs_flash_home for a
+    given intent. Call this any time an intent is forced/overridden after the
+    original flags were computed for a *different* intent, so they don't go
+    stale (e.g. a semantic hint switching "attainment" -> "login" but leaving
+    needs_flash_home=False, which is wrong for login).
+    """
+    result["needs_fresh_join"]   = is_followup or intent in ("cross_join", "free_form")
+    result["needs_flash_reward"] = intent not in ("employee_list", "headcount", "attrition", "pmgm")
+    result["needs_flash_home"]   = intent not in ("attainment", "qualifier", "proration", "cycle_summary")
+
+
 def _regex_fallback(question: str, ctx: dict = None) -> dict:
     """Pure-regex fallback — same output schema as the AI router."""
     from ai_engine import detect_intent
@@ -199,9 +212,10 @@ def route(question: str, history: list, last_df_columns: list = None) -> dict:
     api_key = _get_secret("DEEPSEEK_API_KEY")
     if not api_key:
         result = _regex_fallback(normalised, ctx)
-        if forced_intent:
+        if forced_intent and forced_intent != result["intent"]:
             result["intent"]    = forced_intent
             result["reasoning"] = f"Intent hint: {forced_intent}"
+            _recompute_derived_flags(result, forced_intent, result["is_followup"])
         return result
 
     # ── Build prompt as plain string concatenation — no f-strings with user content ──
@@ -220,6 +234,19 @@ def route(question: str, history: list, last_df_columns: list = None) -> dict:
     safe_q   = _safe(question, 400)
     safe_n   = _safe(normalised, 400)
 
+    # A semantic-layer keyword match is a useful signal but not proof — a naive
+    # substring/phrase match can misfire on unrelated questions. Feed it to the
+    # model as context and let it weigh it against the full conversation,
+    # rather than silently overriding a confident classification below.
+    hint_line = ""
+    if forced_intent:
+        hint_line = (
+            "\n\nBUSINESS-RULE HINT: a configured keyword rule suggests this question "
+            "matches intent '" + forced_intent + "'. Treat it as a strong signal, but if "
+            "the conversation context or question clearly points to a different intent, "
+            "use your own judgement instead."
+        )
+
     user_prompt = (
         "CONVERSATION CONTEXT:\n" + (conv_ctx or "(none)") +
         "\n\nRECENT MESSAGES:\n" + ("\n".join(history_lines) or "(none)") +
@@ -227,6 +254,7 @@ def route(question: str, history: list, last_df_columns: list = None) -> dict:
         "\n\nCURRENT QUESTION: " + safe_q +
         "\nNORMALISED: " + safe_n +
         "\n\nKNOWN INTENTS: " + ", ".join(KNOWN_INTENTS) +
+        hint_line +
         "\n\nRespond with ONLY the JSON object."
     )
 
@@ -261,14 +289,17 @@ def route(question: str, history: list, last_df_columns: list = None) -> dict:
 
         data = json.loads(raw)
 
-        # Apply semantic hint override
-        if forced_intent:
-            data["intent"]    = forced_intent
-            data["reasoning"] = "Semantic hint: " + forced_intent
-
         # Guard unknown intents
         if data.get("intent") not in KNOWN_INTENTS:
             data["intent"] = "free_form"
+
+        # The hint was already shown to the model above. Only step in here if
+        # the model still couldn't commit (fell back to free_form) — in that
+        # case a matched business-rule keyword is more useful than free_form.
+        if forced_intent and data.get("intent") == "free_form":
+            data["intent"]    = forced_intent
+            data["reasoning"] = "Semantic hint (model was unsure): " + forced_intent
+            _recompute_derived_flags(data, forced_intent, data.get("is_followup", False))
 
         # Inherit active filters from context on follow-ups
         if data.get("is_followup") and ctx.get("active_filters"):
@@ -292,9 +323,10 @@ def route(question: str, history: list, last_df_columns: list = None) -> dict:
 
     except Exception as e:
         result = _regex_fallback(normalised, ctx)
-        if forced_intent:
+        if forced_intent and forced_intent != result["intent"]:
             result["intent"]    = forced_intent
             result["reasoning"] = "Hint: " + forced_intent + " (fallback: " + str(e)[:60] + ")"
+            _recompute_derived_flags(result, forced_intent, result["is_followup"])
         else:
             result["reasoning"] = "Regex fallback (router error: " + str(e)[:80] + ")"
         return result
