@@ -78,21 +78,39 @@ def _fmt_axes(fig):
     fig.update_yaxes(gridcolor=grid, zeroline=False, linecolor=grid)
 
 # ── INTENT CLASSIFIER ─────────────────────────────────────────────────────────
+# Order matters: re.search stops at the first match, so narrower/more specific
+# patterns must come before broader ones. free_form (`.*`) must stay LAST since
+# it matches everything.
+#
+# NOTE: this classifier is a fallback used only when DeepSeek is unavailable
+# (no API key, or the API call raised). Every intent the router can return
+# needs a pattern here, or it silently collapses to free_form in that path.
 INTENT_PATTERNS = {
-    # High-specificity patterns first — must come before broad ones like attainment
-    "cross_join":       r"(who are (they|those|these|them)|show.*their name|identify them|name them|which employee|tell me who|who (is|are) (it|that|this)|give me their name)",
-    "cross_check":      r"(non.?active|inactive|left.*payout|payout.*left|leaver|exit)",
-    "country_compare":  r"(compare.*country|country.*compare|vs.*country|country.*vs|\bvs\b.*[A-Z]{2}|compare.*(sg|my|ph|th|id))",
+    "cross_join":       r"(who are (they|those|these|them)|show.*their name|identify them|name them|which employee|tell me who|who (is|are) (it|that|this)|give me their name|who exactly|who specifically|which individuals|list those people|name those employees)",
+    "missing_kpi":      r"(missing kpi|no kpi (this cycle|uploaded|recorded)|kpi.{0,15}not.{0,15}(uploaded|submitted|recorded|on file)|not.{0,15}kpi.{0,15}(uploaded|submitted|recorded|on file)|kpi gap|no performance data|scheme but no kpi|haven'?t submitted kpi|not in (the )?system)",
+    "adjustment":       r"(kpi adjustment|adjusted kpi|adjustment status|kpi override|qualifying status adjustment|pending adjustment|approved adjustment)",
+    "scheme_config":    r"(scheme.{0,15}tier|tier.{0,15}scheme|kpi weightage|scheme structure|scheme configuration|acknowledg.{0,20}scheme|scheme.{0,20}acknowledg|scheme expiry|when does.*scheme.*end|how is the scheme (set ?up|structured|configured))",
+    "login":            r"(last\s*log(ged)?\s*in|login activity|logged in (on|since|recently)|log\s*in\s*(history|activity))",
+    "announcement":     r"(announcement|active during (this|the) cycle|any (news|updates) (this|for the) cycle)",
+    "tenure_compare":   r"(tenure band|by tenure|tenure cohort|years of service|long.?tenured|tenure vs|compare.*tenure|tenure.*compare)",
+    "project_compare":  r"(compare.*project|project.*compare|project.{0,15}comparison|project vs project|per project breakdown|by project|across projects|which project (perform|has))",
+    "kpi_trend":        r"(\btrend\b|over time|across cycles|payout history|kpi history|historical (kpi|payout|trend))",
+    # cross_check = *non-active employees who still show a payout* (an anomaly
+    # check). Plain "leaver"/"resign" questions belong to attrition, so this
+    # requires the payout angle rather than matching "leaver" alone — otherwise
+    # it swallows attrition questions before the attrition pattern is reached.
+    "cross_check":      r"((non.?active|inactive|left|leaver|exit).{0,25}(payout|paid|compensat)|(payout|paid|compensat).{0,25}(non.?active|inactive|left|leaver|exit))",
+    "country_compare":  r"(compare.*countr(y|ies)|countr(y|ies).*compare|vs.*countr(y|ies)|countr(y|ies).*vs|\bvs\b.*[A-Z]{2}|compare.*(sg|my|ph|th|id))",
     "ranking":          r"(top \d+|bottom \d+|highest pay|lowest pay|best perform|worst perform|above.?average|below.?average|hit.*above|hit.*below|rank(ing)?|most paid|least paid|who earn|top perform|highest earning|lowest earning)",
-    "anomaly":          r"(anomaly|mismatch|high.*rating.*low|low.*rating.*high|pmgm.*payout|payout.*pmgm)",
+    "anomaly":          r"(anomaly|anomalies|mismatch|unusual|discrepanc|doesn'?t match|high.*rating.*low|low.*rating.*high|pmgm.*payout|payout.*pmgm)",
     "qualifier":        r"(qualifier|blocked|fail.*qual|qual.*fail)",
-    "proration":        r"(prorat|attendance|absent|proration)",
+    "proration":        r"(prorat|attendance|absent|partial payout)",
     "new_joiner":       r"(new joiner|first cycle|recently joined|new hire)",
     "underperformance": r"(miss|under.?perform|below target|not hit|consistent.*miss|consistent.*below)",
-    "attainment":       r"(hit max|reach max|attain max|max payout|hit.*maximum|% hit|pct.*hit|what %.*payout|payout.*%|% of.*payout|hit full|full payout)",
+    "attainment":       r"(\battainment\b|hit max|reach max|attain max|max payout|hit.*maximum|% hit|pct.*hit|what %.*payout|payout.*%|% of.*payout|hit full|full payout)",
     "employee_list":    r"(show.*name|list.*name|employee.*name|name.*employee|all employee|employee list|staff list|roster|directory)",
-    "headcount":        r"(headcount|how many employee|count.*employee|employee.*count|workforce size|number of employee)",
-    "attrition":        r"(attrition|resign|turnover|leavers)",
+    "headcount":        r"(headcount|how many employee|count.*employee|employee.*count|workforce size|number of employee|how many.*(in|per|by) (each )?countr|breakdown by (country|status)|count by country)",
+    "attrition":        r"(attrition|resign|turnover|leavers?)",
     "pmgm":             r"(pmgm|performance rating|rating distribution|appraisal)",
     "cycle_summary":    r"(summary|overview|this cycle|cycle summary|brief me)",
     "free_form":        r".*",
@@ -183,10 +201,19 @@ def retrieve_data(intent: str, countries: list, question: str):
         pror = pror.merge(fh[name_cols], on="EmployeeID", how="left", suffixes=("","_fh"))
         show = [c for c in ["EmployeeID","EmployeeName","Cycle","Country","Project",
                              "DaysWorked","MaxWorkingDays","DaysAbsent","ProrationFactor"] if c in pror.columns]
+        total_rows = len(pror)
+        shown = pror[show].head(50)
+        cap_note = (
+            f"NOTE: {total_rows} rows matched but only the first {len(shown)} are shown below. "
+            f"Do not describe this as the complete list — say how many rows total, and offer to "
+            f"narrow the filter (country/cycle/project) if the user wants the full set.\n"
+            if total_rows > len(shown) else ""
+        )
         return pror, (
             f"Attendance proration data, scope: {scope}.\n"
             f"Affected: {pror['EmployeeID'].nunique()} employees across {pror['Cycle'].nunique()} cycles\n"
-            f"{pror[show].head(50).to_string(index=False)}"
+            f"{cap_note}"
+            f"{shown.to_string(index=False)}"
         )
 
     elif intent == "anomaly":
@@ -1350,6 +1377,9 @@ ANTI-HALLUCINATION RULES — these are non-negotiable:
 - If the data has 0 rows, say exactly that and do not attempt to answer from memory.
 - Do not carry over specific numbers, names, or dates from prior turns unless they appear
   in the current data context.
+- If the Data Context contains a NOTE about rows being truncated/capped/a sample, treat any
+  summary counts in that context as authoritative but NEVER imply the visible rows are the
+  complete list — state the total count and that the user can narrow the filter to see more.
 
 ANSWER FORMAT for this query type ({intent}):
 {format_hint}
