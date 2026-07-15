@@ -511,25 +511,25 @@ with chat_col:
                 </div>""", unsafe_allow_html=True)
 
                 understood = msg.get("understood")
-                confidence = msg.get("confidence")
-                if understood or confidence is not None:
-                    conf_html = ""
-                    if confidence is not None:
-                        conf_color = "#16A34A" if confidence >= 80 else (AMBER if confidence >= 55 else "#DC2626")
-                        factors = msg.get("confidence_factors") or []
-                        tooltip = "Reliability estimate based on: " + ("; ".join(factors) if factors else "no notable risk factors detected")
-                        conf_html = (
-                            f'<span title="{tooltip}" style="font-family:\'DM Mono\',monospace;'
-                            f'font-size:0.68rem;color:{conf_color};border:1px solid {conf_color}55;'
-                            f'border-radius:8px;padding:1px 7px;margin-left:6px;cursor:help;">'
-                            f'{confidence}%</span>'
-                        )
+                if understood:
                     st.markdown(
                         f'<div style="font-style:italic;font-size:0.70rem;color:{SUBTEXT};'
-                        f'margin-left:32px;padding:0 4px;display:flex;align-items:center;">'
-                        f'{"Understood as: " + understood if understood else ""}{conf_html}</div>',
+                        f'margin-left:32px;padding:0 4px;">Understood as: {understood}</div>',
                         unsafe_allow_html=True,
                     )
+
+                confidence = msg.get("confidence")
+                if confidence is not None:
+                    conf_word = "green" if confidence >= 80 else ("orange" if confidence >= 55 else "red")
+                    factors = msg.get("confidence_factors") or []
+                    with st.popover(f":{conf_word}[Reliability: {confidence}%]"):
+                        st.caption("Heuristic estimate based on how this reply was produced "
+                                   "— not a statistical probability.")
+                        if factors:
+                            for f in factors:
+                                st.markdown(f"- {f}")
+                        else:
+                            st.markdown("No notable risk factors detected for this reply.")
 
                 scope_note = msg.get("scope_note")
                 if scope_note:
