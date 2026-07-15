@@ -503,23 +503,41 @@ with chat_col:
                 st.markdown(f"""
                 <div style="display:flex;align-items:flex-start;gap:8px;margin:4px 0 6px;">
                     <div style="width:24px;height:24px;border-radius:50%;flex-shrink:0;margin-top:3px;{ASSISTANT_AVATAR}"></div>
-                    <div style="max-width:84%;">
-                        <div style="background:{CARD};border:1px solid {BORDER};
-                                    border-radius:4px 16px 16px 16px;padding:12px 16px;
-                                    font-family:'Inter',sans-serif;font-size:0.88rem;
-                                    color:{TEXT};line-height:1.65;box-shadow:0 1px 4px rgba(0,0,0,0.05);">
-                            {content_html}</div>
-                        {f'''<div style="font-style:italic;font-size:0.70rem;color:{SUBTEXT};
-                                     padding:4px 4px 0;">Understood as: {msg["understood"]}</div>'''
-                          if msg.get("understood") else ""}
-                        {f'''<div style="font-size:0.72rem;color:{AMBER};padding:3px 4px 0;
-                                     display:flex;align-items:center;gap:5px;">
-                                <span>&#8635;</span><span>{msg["scope_note"]}
-                                — if this looks off, starting a new chat resets the context.</span>
-                             </div>'''
-                          if msg.get("scope_note") else ""}
-                    </div>
+                    <div style="background:{CARD};border:1px solid {BORDER};
+                                border-radius:4px 16px 16px 16px;padding:12px 16px;
+                                max-width:84%;font-family:'Inter',sans-serif;font-size:0.88rem;
+                                color:{TEXT};line-height:1.65;box-shadow:0 1px 4px rgba(0,0,0,0.05);">
+                        {content_html}</div>
                 </div>""", unsafe_allow_html=True)
+
+                understood = msg.get("understood")
+                confidence = msg.get("confidence")
+                if understood or confidence is not None:
+                    conf_html = ""
+                    if confidence is not None:
+                        conf_color = "#16A34A" if confidence >= 80 else (AMBER if confidence >= 55 else "#DC2626")
+                        factors = msg.get("confidence_factors") or []
+                        tooltip = "Reliability estimate based on: " + ("; ".join(factors) if factors else "no notable risk factors detected")
+                        conf_html = (
+                            f'<span title="{tooltip}" style="font-family:\'DM Mono\',monospace;'
+                            f'font-size:0.68rem;color:{conf_color};border:1px solid {conf_color}55;'
+                            f'border-radius:8px;padding:1px 7px;margin-left:6px;cursor:help;">'
+                            f'{confidence}%</span>'
+                        )
+                    st.markdown(
+                        f'<div style="font-style:italic;font-size:0.70rem;color:{SUBTEXT};'
+                        f'margin-left:32px;padding:0 4px;display:flex;align-items:center;">'
+                        f'{"Understood as: " + understood if understood else ""}{conf_html}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                scope_note = msg.get("scope_note")
+                if scope_note:
+                    st.markdown(
+                        f'<div style="font-size:0.72rem;color:{AMBER};margin-left:32px;padding:2px 4px 0;">'
+                        f'&#8635; {scope_note} — if this looks off, starting a new chat resets the context.</div>',
+                        unsafe_allow_html=True,
+                    )
 
                 if has_panel:
                     is_open_now = panel_is_open() and st.session_state["panel_idx"] == current_panel_idx
@@ -811,6 +829,8 @@ if pending:
         "content": text,
         "understood": debug_info.get("understood_label"),
         "scope_note": debug_info.get("scope_note"),
+        "confidence": debug_info.get("confidence_score"),
+        "confidence_factors": debug_info.get("confidence_factors"),
     })
 
     # ── Smart response summary via DeepSeek Flash ─────────────────────────────
