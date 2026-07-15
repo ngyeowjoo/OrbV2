@@ -503,11 +503,22 @@ with chat_col:
                 st.markdown(f"""
                 <div style="display:flex;align-items:flex-start;gap:8px;margin:4px 0 6px;">
                     <div style="width:24px;height:24px;border-radius:50%;flex-shrink:0;margin-top:3px;{ASSISTANT_AVATAR}"></div>
-                    <div style="background:{CARD};border:1px solid {BORDER};
-                                border-radius:4px 16px 16px 16px;padding:12px 16px;
-                                max-width:84%;font-family:'Inter',sans-serif;font-size:0.88rem;
-                                color:{TEXT};line-height:1.65;box-shadow:0 1px 4px rgba(0,0,0,0.05);">
-                        {content_html}</div>
+                    <div style="max-width:84%;">
+                        <div style="background:{CARD};border:1px solid {BORDER};
+                                    border-radius:4px 16px 16px 16px;padding:12px 16px;
+                                    font-family:'Inter',sans-serif;font-size:0.88rem;
+                                    color:{TEXT};line-height:1.65;box-shadow:0 1px 4px rgba(0,0,0,0.05);">
+                            {content_html}</div>
+                        {f'''<div style="font-style:italic;font-size:0.70rem;color:{SUBTEXT};
+                                     padding:4px 4px 0;">Understood as: {msg["understood"]}</div>'''
+                          if msg.get("understood") else ""}
+                        {f'''<div style="font-size:0.72rem;color:{AMBER};padding:3px 4px 0;
+                                     display:flex;align-items:center;gap:5px;">
+                                <span>&#8635;</span><span>{msg["scope_note"]}
+                                — if this looks off, starting a new chat resets the context.</span>
+                             </div>'''
+                          if msg.get("scope_note") else ""}
+                    </div>
                 </div>""", unsafe_allow_html=True)
 
                 if has_panel:
@@ -795,7 +806,12 @@ if pending:
     if not text.strip():
         text = "No data was found for your query within your permitted scope."
 
-    st.session_state["messages"].append({"role": "assistant", "content": text})
+    st.session_state["messages"].append({
+        "role": "assistant",
+        "content": text,
+        "understood": debug_info.get("understood_label"),
+        "scope_note": debug_info.get("scope_note"),
+    })
 
     # ── Smart response summary via DeepSeek Flash ─────────────────────────────
     # Runs async-style: fire-and-forget in a try/except so it never blocks.
