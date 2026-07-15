@@ -92,7 +92,7 @@ INTENT_PATTERNS = {
     "scheme_config":    r"(scheme.{0,15}tier|tier.{0,15}scheme|kpi weightage|scheme structure|scheme configuration|acknowledg.{0,20}scheme|scheme.{0,20}acknowledg|scheme expiry|when does.*scheme.*end|how is the scheme (set ?up|structured|configured))",
     "login":            r"(last\s*log(ged)?\s*in|login activity|logged in (on|since|recently)|log\s*in\s*(history|activity))",
     "announcement":     r"(announcement|active during (this|the) cycle|any (news|updates) (this|for the) cycle)",
-    "tenure_compare":   r"(tenure band|by tenure|tenure cohort|years of service|long.?tenured|tenure vs|compare.*tenure|tenure.*compare)",
+    "tenure_compare":   r"(tenure band|\bby\b.{0,20}\btenure\b|tenure cohort|years of service|long.?tenured|tenure vs|compare.*tenure|tenure.*compare|performance.*tenure|tenure.*performance|tenured.*earn|earn.*more.*tenure)",
     "project_compare":  r"(compare.*project|project.*compare|project.{0,15}comparison|project vs project|per project breakdown|by project|across projects|which project (perform|has))",
     "kpi_trend":        r"(\btrend\b|over time|across cycles|payout history|kpi history|historical (kpi|payout|trend))",
     # cross_check = *non-active employees who still show a payout* (an anomaly
