@@ -1175,6 +1175,59 @@ def rewrite_followup_question(question: str, history: list,
 
 
 # ── MAIN ENTRY POINT ──────────────────────────────────────────────────────────
+def _estimate_confidence(routing: dict, retrieval_mode: str, intent: str,
+                          df, data_context: str, scope_note: str) -> tuple:
+    """
+    Heuristic reliability indicator (0-100) for a reply, built ONLY from
+    concrete pipeline signals — never asked of the LLM itself, since models
+    are notoriously badly calibrated about their own confidence and asking
+    would just add another thing that could be hallucinated. Every deduction
+    below corresponds to a real, checkable fact about how the answer was
+    produced (which router path fired, which retrieval path fired, whether
+    data was truncated, etc.), returned alongside the score so the UI can
+    show *why*, not just a bare number.
+
+    This is a heuristic, not a statistically calibrated probability — treat
+    it as "how many known risk factors applied," not "P(this answer is
+    correct)".
+    """
+    score = 95
+    factors = []
+    reasoning = (routing.get("reasoning") or "").lower()
+
+    if "regex fallback" in reasoning:
+        score -= 25
+        factors.append("DeepSeek router was unavailable — used keyword-based fallback routing")
+    if "model was unsure" in reasoning:
+        score -= 15
+        factors.append("AI router wasn't confident — fell back to a configured keyword hint")
+
+    if retrieval_mode == "vector":
+        score -= 20
+        factors.append("used fuzzy semantic search rather than a direct data query")
+
+    if intent == "free_form":
+        score -= 15
+        factors.append("open-ended question without a specific data match")
+
+    row_count = len(df) if df is not None else 0
+    if row_count == 0:
+        score -= 10
+        factors.append("no matching rows were found for this question")
+
+    ctx_text = data_context or ""
+    if "only the first" in ctx_text.lower() or "truncated" in ctx_text.lower():
+        score -= 10
+        factors.append("result set was capped — not every matching row was shown to the model")
+
+    if scope_note:
+        score -= 8
+        factors.append("follow-up switched topic and had to re-scope the data")
+
+    score = max(30, min(97, score))
+    return score, factors
+
+
 def answer(question: str, history: list, user: dict,
            model_name: str = DEFAULT_MODEL, last_df=None):
     """
@@ -1263,7 +1316,22 @@ def answer(question: str, history: list, user: dict,
 
     scope_note = ""
     if needs_fresh or is_followup:
-        if is_followup and intent in _SPECIALIZED_DOMAIN_INTENTS:
+        # A follow-up needs fresh, intent-appropriate retrieval (rather than the
+        # flat HR+reward enrichment below) whenever:
+        #   (a) the classified intent genuinely changed from last turn's topic, or
+        #   (b) the intent is one of the specialized-table intents, which can
+        #       never be answered from HR+reward fields even on a repeat visit
+        #       (e.g. staying on "login" two turns in a row).
+        # cross_join is excluded from (a) — it's definitionally "tell me more
+        # about the same employees", so the flat enrichment is exactly right
+        # for it even though its "intent" differs from whatever came before.
+        prev_intent = ctx.get("topic_intent")
+        topic_switched = (
+            prev_intent is not None and intent != prev_intent and intent != "cross_join"
+        )
+        needs_domain_switch = topic_switched or intent in _SPECIALIZED_DOMAIN_INTENTS
+
+        if needs_domain_switch:
             try:
                 df, data_context, scope_note = _get_scoped_fresh_context(
                     intent, scoped_countries, last_df, route_q
@@ -1490,17 +1558,23 @@ Data context:
     if _filter_bits:
         understood_label += " · " + " · ".join(_filter_bits)
 
+    confidence_score, confidence_factors = _estimate_confidence(
+        routing, retrieval_mode, intent, df, data_context, scope_note
+    )
+
     debug_info = {
-        "routing":          routing,
-        "intent":           intent,
-        "retrieval_mode":   retrieval_mode,
-        "data_context":     data_context,
-        "system_prompt":    system,
-        "conv_context":     conv_context_block,
-        "max_tokens":       max_tokens,
-        "rewritten_q":      rewritten_q if rewritten_q != display_q else None,
-        "understood_label": understood_label,
-        "scope_note":       scope_note,
+        "routing":            routing,
+        "intent":             intent,
+        "retrieval_mode":     retrieval_mode,
+        "data_context":       data_context,
+        "system_prompt":      system,
+        "conv_context":       conv_context_block,
+        "max_tokens":         max_tokens,
+        "rewritten_q":        rewritten_q if rewritten_q != display_q else None,
+        "understood_label":   understood_label,
+        "scope_note":         scope_note,
+        "confidence_score":   confidence_score,
+        "confidence_factors": confidence_factors,
     }
 
     # Use original question in history so conversation reads naturally
