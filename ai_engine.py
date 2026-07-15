@@ -1023,6 +1023,66 @@ def _get_followup_context(countries: list, last_df) -> tuple:
     return joined, desc
 
 
+# Intents whose answer needs a data table that _get_followup_context's Path 1
+# enrichment (HR fields + latest-cycle reward fields) does NOT cover. If a
+# follow-up's classified intent falls in this set, reusing the enriched
+# last_df will look like "no data" to the model — correctly, per the
+# anti-hallucination rules, since the table genuinely isn't there. These get
+# routed through _get_scoped_fresh_context instead. See retrieve_data() below
+# for what each of these actually pulls from (get_attendance, get_login_audit,
+# get_announcement, get_kpi_adjustment, get_incentive_scheme/tier/*, etc.)
+_SPECIALIZED_DOMAIN_INTENTS = {
+    "proration", "kpi_trend", "missing_kpi", "adjustment",
+    "scheme_config", "login", "announcement",
+}
+
+
+def _get_scoped_fresh_context(intent: str, countries: list, last_df, question: str) -> tuple:
+    """
+    Fresh, intent-appropriate retrieval for a follow-up that switched to a
+    specialized data domain. Where possible, narrows the fresh result to the
+    same employees the user was just discussing (from last_df), so it still
+    reads as a follow-up rather than a company-wide query. If none of those
+    employees have rows in the new table, falls back to the full scoped
+    result and says so explicitly, in both the data context (for the model)
+    and the returned scope_note (for the UI to optionally surface).
+
+    Returns (df, data_context, scope_note). scope_note is "" when nothing
+    unusual happened (no prior employees to narrow to, or narrowing worked
+    with no need to explain it beyond the data context itself).
+    """
+    df, data_context = retrieve_data(intent, countries, question)
+
+    prior_ids = None
+    if last_df is not None and "EmployeeID" in last_df.columns and not last_df.empty:
+        prior_ids = set(last_df["EmployeeID"].dropna().tolist())
+
+    if not prior_ids or df is None or df.empty or "EmployeeID" not in df.columns:
+        return df, data_context, ""
+
+    narrowed = df[df["EmployeeID"].isin(prior_ids)]
+    label = intent.replace("_", " ")
+
+    if narrowed.empty:
+        scope_note = (
+            f"Switched to {label} data — none of the employees from your previous "
+            f"question have {label} records, so this is the full scope instead."
+        )
+        return df, data_context + f"\n\nNOTE TO AI: {scope_note}", scope_note
+
+    scope_note = (
+        f"Switched to {label} data — narrowed to the {len(narrowed)} employee(s) "
+        f"from your previous question."
+    )
+    narrowed_desc = (
+        f"FOLLOW-UP CONTEXT (topic switched to {intent}) — "
+        f"{len(narrowed)} employee(s) from the previous result.\n"
+        f"Columns: {', '.join(narrowed.columns.tolist())}\n"
+        f"{narrowed.to_string(index=False)}"
+    )
+    return narrowed, narrowed_desc, scope_note
+
+
 def rewrite_followup_question(question: str, history: list,
                               last_df, model_name: str) -> str:
     """
@@ -1201,13 +1261,24 @@ def answer(question: str, history: list, user: dict,
         and intent == "free_form"
     )
 
+    scope_note = ""
     if needs_fresh or is_followup:
-        try:
-            df, data_context = _get_followup_context(scoped_countries, last_df)
-            chart = None
-        except Exception:
-            df, data_context = retrieve_data(intent, scoped_countries, route_q)
-            chart = build_chart(intent, df)
+        if is_followup and intent in _SPECIALIZED_DOMAIN_INTENTS:
+            try:
+                df, data_context, scope_note = _get_scoped_fresh_context(
+                    intent, scoped_countries, last_df, route_q
+                )
+                chart = build_chart(intent, df)
+            except Exception:
+                df, data_context = _get_followup_context(scoped_countries, last_df)
+                chart = None
+        else:
+            try:
+                df, data_context = _get_followup_context(scoped_countries, last_df)
+                chart = None
+            except Exception:
+                df, data_context = retrieve_data(intent, scoped_countries, route_q)
+                chart = build_chart(intent, df)
 
     elif intent == "free_form" and not use_vector:
         try:
@@ -1409,15 +1480,27 @@ Data context:
         "vector"     if use_vector else
         "live_query"
     )
+    # ── Human-readable "what the AI understood" label, for UI transparency ────
+    _filter_bits = []
+    for fkey, flabel in (("country", None), ("scheme", "Scheme"), ("cycle", "Cycle"), ("threshold", "Threshold")):
+        fval = filters.get(fkey)
+        if fval:
+            _filter_bits.append(str(fval) if flabel is None else f"{flabel}: {fval}")
+    understood_label = intent.replace("_", " ")
+    if _filter_bits:
+        understood_label += " · " + " · ".join(_filter_bits)
+
     debug_info = {
-        "routing":        routing,
-        "intent":         intent,
-        "retrieval_mode": retrieval_mode,
-        "data_context":   data_context,
-        "system_prompt":  system,
-        "conv_context":   conv_context_block,
-        "max_tokens":     max_tokens,
-        "rewritten_q":    rewritten_q if rewritten_q != display_q else None,
+        "routing":          routing,
+        "intent":           intent,
+        "retrieval_mode":   retrieval_mode,
+        "data_context":     data_context,
+        "system_prompt":    system,
+        "conv_context":     conv_context_block,
+        "max_tokens":       max_tokens,
+        "rewritten_q":      rewritten_q if rewritten_q != display_q else None,
+        "understood_label": understood_label,
+        "scope_note":       scope_note,
     }
 
     # Use original question in history so conversation reads naturally
