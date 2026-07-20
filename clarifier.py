@@ -84,6 +84,11 @@ def _mentions_anomaly_direction(q: str) -> bool:
         q, re.IGNORECASE
     ))
 
+# Intents where "which country/region" is a meaningful ambiguity for a
+# multi-country user. Shared between needs_clarification (Rule 4) and the
+# live query-clarity estimator below, so the two stay consistent.
+_COUNTRY_SENSITIVE = {"ranking", "anomaly", "underperformance", "qualifier", "cross_check"}
+
 
 # ── CORE DECISION FUNCTION ────────────────────────────────────────────────────
 
@@ -162,7 +167,6 @@ def needs_clarification(
     # ── RULE 4: Country ambiguity for multi-country users ───────────────────
     countries = user.get("countries", [])
     has_multi = len(countries) > 1 or "ALL" in countries
-    _COUNTRY_SENSITIVE = {"ranking", "anomaly", "underperformance", "qualifier", "cross_check"}
     if (intent in _COUNTRY_SENSITIVE
             and has_multi
             and not _mentions_country(q_lower)):
@@ -217,6 +221,65 @@ def needs_clarification(
 
 
 # ── MESSAGE BUILDER ───────────────────────────────────────────────────────────
+
+# ── LIVE QUERY CLARITY (non-blocking) ─────────────────────────────────────────
+
+def estimate_query_clarity(question: str, routing: dict, needs_clar: bool, user: dict) -> tuple:
+    """
+    A 0-100 "how well-specified was this question" score shown right after
+    the user sends it — purely informational, never blocks sending.
+
+    Deliberately reuses the exact same signals as needs_clarification() above
+    rather than a separate heuristic, so the score and the actual
+    clarification behaviour can never disagree with each other. This is
+    about the QUESTION's phrasing/specificity, not the reply's reliability —
+    see _estimate_confidence() in ai_engine.py for that, which factors in
+    retrieval mechanics as well.
+
+    Returns (score, factors) — factors are short, user-facing explanations
+    ("no country specified"), not internal routing details.
+    """
+    intent  = routing.get("intent", "free_form")
+    q_lower = question.lower().strip()
+    score = 95
+    factors = []
+
+    if needs_clar:
+        # The system is about to ask a genuine clarifying question — that's
+        # the clearest possible signal the phrasing was ambiguous.
+        score -= 35
+        factors.append("the question needed a follow-up to answer accurately")
+
+    if intent == "free_form":
+        score -= 20
+        factors.append("no specific data area was recognised — try naming a metric (e.g. attainment, headcount, attrition)")
+
+    if "regex fallback" in (routing.get("reasoning") or "").lower():
+        score -= 10
+        factors.append("the AI router was unavailable, so this was matched by keyword only")
+
+    countries = user.get("countries", [])
+    has_multi = len(countries) > 1 or "ALL" in countries
+    if intent in _COUNTRY_SENSITIVE and has_multi and not _mentions_country(q_lower):
+        score -= 15
+        factors.append("no country/region specified — add one, or say 'across all countries'")
+
+    if intent == "anomaly" and not _mentions_anomaly_direction(q_lower):
+        score -= 10
+        factors.append("didn't specify which direction of anomaly (e.g. high rating, low payout)")
+
+    if intent in ("ranking", "cycle_summary") and not re.search(r"\d+", question) \
+            and not re.search(r"\b(top|bottom|highest|lowest|all|everyone)\b", q_lower):
+        score -= 8
+        factors.append("no specific number or ranking direction given")
+
+    if len(question.split()) <= 2:
+        score -= 10
+        factors.append("very short — a bit more detail usually helps")
+
+    score = max(30, min(97, score))
+    return score, factors
+
 
 def build_clarification_message(cr: ClarificationRequest) -> str:
     """
