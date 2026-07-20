@@ -13,7 +13,7 @@ from chat_store import save_chat, load_all, load_chat, delete_chat, fmt_ts
 from conversation_state import get_ctx, reset_ctx, add_response_summary
 from clarifier import needs_clarification, build_clarification_message, \
                       store_clarification_buttons, resolve_clarification, \
-                      ClarificationRequest
+                      ClarificationRequest, estimate_query_clarity
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PAGE CONFIG
@@ -97,7 +97,7 @@ ASSISTANT_AVATAR = (
     "box-shadow:0 0 6px rgba(217,119,6,0.28);"
 )
 
-def render_user_bubble(content):
+def render_user_bubble(content, clarity=None, clarity_factors=None):
     st.markdown(f"""
     <div style="display:flex;justify-content:flex-end;margin:14px 0 4px;">
         <div style="background:{USERBG};border:1px solid {BORDER};
@@ -106,6 +106,19 @@ def render_user_bubble(content):
                     font-size:0.88rem;color:{TEXT};line-height:1.55;">
             {content}</div>
     </div>""", unsafe_allow_html=True)
+
+    if clarity is not None:
+        conf_word = "green" if clarity >= 80 else ("orange" if clarity >= 55 else "red")
+        _, pop_col = st.columns([3, 1])
+        with pop_col:
+            with st.popover(f":{conf_word}[Clarity: {clarity}%]", use_container_width=True):
+                st.caption("How well-specified this question was — never blocks sending, "
+                           "just a hint for next time.")
+                if clarity_factors:
+                    for f in clarity_factors:
+                        st.markdown(f"- {f}")
+                else:
+                    st.markdown("No ambiguity detected.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -491,7 +504,7 @@ with chat_col:
         assistant_idx = 0
         for i, msg in enumerate(msgs):
             if msg["role"] == "user":
-                render_user_bubble(msg["content"])
+                render_user_bubble(msg["content"], msg.get("clarity"), msg.get("clarity_factors"))
             else:
                 has_panel = (assistant_idx < len(panels) and
                     (panels[assistant_idx].get("chart") is not None or
@@ -737,6 +750,15 @@ if pending:
     _ctx = get_ctx()
 
     _needs_clar, _clar_request = needs_clarification(q, _pre_routing, _ctx, user)
+
+    # ── Live query clarity score (never blocks — see clarifier.estimate_query_clarity) ──
+    # Skipped when this turn is just resolving a clarification button click
+    # (cr was set above) — scoring "Singapore" as a standalone question isn't useful.
+    if not cr:
+        _clarity_score, _clarity_factors = estimate_query_clarity(q, _pre_routing, _needs_clar, user)
+        if st.session_state["messages"] and st.session_state["messages"][-1]["role"] == "user":
+            st.session_state["messages"][-1]["clarity"] = _clarity_score
+            st.session_state["messages"][-1]["clarity_factors"] = _clarity_factors
 
     if _needs_clar and _clar_request:
         # Send the clarification question as Orb's response
