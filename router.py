@@ -67,6 +67,17 @@ Set is_followup = true when:
 - Question is too short to stand alone (e.g. "when did they join?", "what is their grade?")
 - Conversation context shows an established topic and this drills deeper
 
+FILTER EXTRACTION — do not confuse "grouped by X" with "filtered to X":
+- "break that down by country" / "a breakdown by country" / "across countries" / "by country"
+  means GROUP the result by country — the user wants to see every country dimensioned out,
+  not narrowed to one. Do NOT set filters.country in this case (leave it null), and prefer
+  intent: country_compare over keeping the prior intent, since only country_compare actually
+  produces a per-country breakdown. The same logic applies to "by project" -> project_compare
+  and "by tenure" -> tenure_compare.
+- Only set filters.country when the user names a SPECIFIC country/region they want narrowed
+  to (a country name, code, or "just Singapore", "only for Malaysia", etc.) — never guess or
+  default to a country that merely appeared somewhere in the prior answer's text.
+
 === DISAMBIGUATION EXAMPLES ===
 
 Q: "when did that employee join?" — intent: cross_join, is_followup: true, needs_fresh_join: true
@@ -85,7 +96,8 @@ Q: "who are the underperformers?" — intent: underperformance
 Q: "who are they?" (after underperformance result) — intent: cross_join, is_followup: true
 Q: "name those employees" (after any result) — intent: cross_join, is_followup: true
 Q: "show me in SG" (after headcount result) — same intent as prior, is_followup: true, filter country: SG
-Q: "break that down by country" — same intent as prior, is_followup: true
+Q: "break that down by country" (after any result) — intent: country_compare, is_followup: true, filter country: null
+Q: "need a breakdown by country or by specific employee names" (after a pmgm/headcount/etc result) — intent: cross_join, is_followup: true, filter country: null — the user wants individual records to work from, not a single country filtered out
 Q: "what about the ones who left?" — intent: cross_check, is_followup: true
 
 Q: "compare countries" — intent: country_compare
@@ -108,6 +120,8 @@ Q: "payout history for employee" — intent: kpi_trend
 
 Q: "compare employees with 1 year vs 3 years tenure" — intent: tenure_compare
 Q: "incentive by tenure band" — intent: tenure_compare
+Q: "can I see performance by employee tenure?" — intent: tenure_compare
+Q: "do longer-tenured employees earn more?" — intent: tenure_compare
 
 Q: "who has not had kpi uploaded?" — intent: missing_kpi
 Q: "kpi not submitted" — intent: missing_kpi
