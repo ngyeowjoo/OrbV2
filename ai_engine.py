@@ -1366,6 +1366,23 @@ def answer(question: str, history: list, user: dict,
         clear_clarification()
 
     # ── Step 2: Country scope ─────────────────────────────────────────────────
+    # Guard against "breakdown by country" being misread as "filter to one
+    # country" (a real router misclassification seen in practice) — if the
+    # question is clearly asking to GROUP by country rather than narrow to a
+    # specific one, ignore any country filter the router returned. Checked
+    # independently of the router prompt instruction above, as a safety net.
+    _wants_country_breakdown = bool(re.search(
+        r"\b(break.{0,15}down|breakdown|split|group|segment)\b.{0,20}\bby\b.{0,10}\bcountr(y|ies)\b"
+        r"|\bby\s+countr(y|ies)\b|\bacross\s+countr(y|ies)\b|\bper\s+countr(y|ies)\b|\beach\s+countr(y|ies)\b",
+        route_q, re.IGNORECASE
+    ))
+    _names_specific_country = bool(re.search(
+        r"\b(singapore|malaysia|philippines|thailand|indonesia|sg|my|ph|th|id)\b",
+        route_q, re.IGNORECASE
+    ))
+    if _wants_country_breakdown and not _names_specific_country:
+        filters["country"] = None
+
     scoped_countries = countries
     if filters.get("country") and "ALL" not in countries:
         rc = filters["country"].upper()
@@ -1374,17 +1391,21 @@ def answer(question: str, history: list, user: dict,
     elif filters.get("country") and "ALL" in countries:
         scoped_countries = [filters["country"].upper()]
 
-    # Inherit scoped country from pinned scope or conversation context
-    pinned = ctx.get("pinned_country")
-    if pinned and not filters.get("country"):
-        if "ALL" in countries or pinned in countries:
-            scoped_countries = [pinned]
-    elif not filters.get("country") and ctx["active_filters"].get("country"):
-        inherited = ctx["active_filters"]["country"]
-        if "ALL" not in countries and inherited in countries:
-            scoped_countries = [inherited]
-        elif "ALL" in countries:
-            scoped_countries = [inherited]
+    # Inherit scoped country from pinned scope or conversation context —
+    # skipped entirely when the question explicitly wants a country
+    # breakdown, so a previously pinned/active country can't silently
+    # re-narrow scope right after the guard above cleared it.
+    if not _wants_country_breakdown:
+        pinned = ctx.get("pinned_country")
+        if pinned and not filters.get("country"):
+            if "ALL" in countries or pinned in countries:
+                scoped_countries = [pinned]
+        elif not filters.get("country") and ctx["active_filters"].get("country"):
+            inherited = ctx["active_filters"]["country"]
+            if "ALL" not in countries and inherited in countries:
+                scoped_countries = [inherited]
+            elif "ALL" in countries:
+                scoped_countries = [inherited]
 
     # ── Step 3: Retrieve data ─────────────────────────────────────────────────
     from vector_store import VECTOR_STORE_ENABLED, vector_retrieve, status as vs_status
