@@ -1449,14 +1449,24 @@ def answer(question: str, history: list, user: dict,
             #   (a) the classified intent genuinely changed from last turn's topic, or
             #   (b) the intent is one of the specialized-table intents, which can
             #       never be answered from HR+reward fields even on a repeat visit
-            #       (e.g. staying on "login" two turns in a row).
+            #       (e.g. staying on "login" two turns in a row), or
+            #   (c) the intent is one of the aggregate-shaped intents (pmgm,
+            #       headcount, country/tenure/project_compare) — these return a
+            #       GROUPED table with no EmployeeID, so even asking the exact
+            #       same question again would otherwise fall through to the flat
+            #       per-employee join instead of a real re-aggregation. This bit
+            #       the exact case (b) doesn't catch: same intent, repeat visit.
             # cross_join is excluded from (a) — it's definitionally "tell me more
             # about the same employees", so the flat enrichment is exactly right
             # for it even though its "intent" differs from whatever came before.
             topic_switched = (
                 prev_intent is not None and intent != prev_intent and intent != "cross_join"
             )
-            needs_domain_switch = topic_switched or intent in _SPECIALIZED_DOMAIN_INTENTS
+            needs_domain_switch = (
+                topic_switched
+                or intent in _SPECIALIZED_DOMAIN_INTENTS
+                or intent in _DRILLABLE_AGGREGATES
+            )
 
             if needs_domain_switch:
                 try:
