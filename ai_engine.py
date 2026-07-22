@@ -149,6 +149,19 @@ def _add_names(df, countries):
         return df
 
 # ── DATA RETRIEVAL ────────────────────────────────────────────────────────────
+def _tenure_band(years) -> str:
+    """Shared tenure-band cutoffs — used by the tenure_compare aggregation
+    AND _drill_into_prior_aggregate, so a follow-up drilling into e.g.
+    '5-10 years' always matches the same bucket the aggregate table used."""
+    if pd.isna(years): return "Unknown"
+    if years < 1:  return "< 1 year"
+    if years < 2:  return "1–2 years"
+    if years < 3:  return "2–3 years"
+    if years < 5:  return "3–5 years"
+    if years < 10: return "5–10 years"
+    return "10+ years"
+
+
 def retrieve_data(intent: str, countries: list, question: str):
     from data import (
         attainment_summary, underperformer_summary,
@@ -499,15 +512,7 @@ def retrieve_data(intent: str, countries: list, question: str):
         cyc    = fr[fr["Cycle"]==latest].drop_duplicates("EmployeeID")
         fh_t = fh[["EmployeeID","JoinDate","EmployeeName","Project","Country"]].copy()
         fh_t["TenureYears"] = ((pd.Timestamp.today() - fh_t["JoinDate"]).dt.days / 365.25).round(1)
-        def _band(y):
-            if pd.isna(y): return "Unknown"
-            if y < 1:  return "< 1 year"
-            if y < 2:  return "1–2 years"
-            if y < 3:  return "2–3 years"
-            if y < 5:  return "3–5 years"
-            if y < 10: return "5–10 years"
-            return "10+ years"
-        fh_t["TenureBand"] = fh_t["TenureYears"].apply(_band)
+        fh_t["TenureBand"] = fh_t["TenureYears"].apply(_tenure_band)
         merged = cyc.merge(fh_t, on="EmployeeID", how="left")
         band_order = ["< 1 year","1–2 years","2–3 years","3–5 years","5–10 years","10+ years","Unknown"]
         comp = merged.groupby("TenureBand").agg(
@@ -1083,6 +1088,92 @@ def _get_scoped_fresh_context(intent: str, countries: list, last_df, question: s
     return narrowed, narrowed_desc, scope_note
 
 
+# Aggregated intents where the grouping column is a meaningful "category" a
+# user might later drill into by name (e.g. "who are the Below Expectations
+# ones"). Maps intent -> the grouping column name as it appears in that
+# intent's aggregated result (see retrieve_data() above).
+_DRILLABLE_AGGREGATES = {
+    "pmgm":            "PMGMRating",
+    "headcount":       "EmployeeStatus",
+    "country_compare": "Country",
+    "tenure_compare":  "TenureBand",
+    "project_compare": "Project",
+}
+
+
+def _drill_into_prior_aggregate(prev_intent: str, question: str, last_df, countries: list) -> tuple:
+    """
+    Handles a follow-up that asks to list the individuals behind one slice of
+    the PREVIOUS turn's aggregated result. Aggregated results (PMGM
+    distribution, headcount, tenure/country/project breakdowns) never carry
+    per-employee rows — the groupby collapses them — so there's nothing for
+    the normal last_df-narrowing logic to work with, and it was falling
+    through to an unrelated free_form sample.
+
+    Instead: read the actual category VALUES out of the previous aggregated
+    df (e.g. 'Below Expectations', '5–10 years', 'Singapore') rather than
+    guessing from a hardcoded phrase list, check whether the follow-up
+    mentions one of them, and if so re-fetch the underlying per-employee
+    table filtered to exactly that value — so it can never disagree with the
+    categorisation the user is looking at on screen.
+
+    Returns (df, data_context) or (None, None) if this isn't that kind of
+    follow-up (caller falls through to normal follow-up handling).
+    """
+    group_col = _DRILLABLE_AGGREGATES.get(prev_intent)
+    if not group_col or last_df is None or group_col not in getattr(last_df, "columns", []):
+        return None, None
+
+    q_lower = re.sub(r"[–—]", "-", question.lower())
+    candidates = [str(v) for v in last_df[group_col].dropna().unique().tolist()]
+
+    def _lenient_pattern(value: str) -> str:
+        # Tolerate minor phrasing drift like singular/plural ("expectation" vs
+        # "expectations") by making a trailing 's' on each word optional,
+        # and normalise en-dash vs hyphen ("5–10 years" vs "5-10 years"),
+        # rather than requiring an exact substring match.
+        value = re.sub(r"[–—]", "-", value)
+        parts = []
+        for word in value.split():
+            w = re.escape(word.rstrip("s")) if word.endswith("s") and len(word) > 3 else re.escape(word)
+            parts.append(w + ("s?" if word.endswith("s") and len(word) > 3 else ""))
+        return r"\s+".join(parts)
+
+    matched_value = next(
+        (v for v in candidates if re.search(_lenient_pattern(v), q_lower, re.IGNORECASE)),
+        None,
+    )
+    if not matched_value:
+        return None, None
+
+    from data import get_flash_home
+    fh = get_flash_home(countries)
+
+    if group_col in fh.columns:
+        matched = fh[fh[group_col] == matched_value]
+    elif group_col == "TenureBand":
+        joined = fh.copy()
+        joined["TenureYears"] = ((pd.Timestamp.today() - joined["JoinDate"]).dt.days / 365.25).round(1)
+        joined["TenureBand"] = joined["TenureYears"].apply(_tenure_band)
+        matched = joined[joined["TenureBand"] == matched_value]
+    else:
+        return None, None
+
+    if matched.empty:
+        return None, None
+
+    show = [c for c in [
+        "EmployeeID", "EmployeeName", "Country", "Project", "JoinDate",
+        "EmployeeStatus", "JobTitle", "EmployeeGrade", "PMGMRating",
+    ] if c in matched.columns]
+    desc = (
+        f"Employees where {group_col} = '{matched_value}' ({len(matched)} found, "
+        f"drilled down from your previous {prev_intent.replace('_',' ')} result).\n"
+        f"{matched[show].to_string(index=False)}"
+    )
+    return matched, desc
+
+
 def rewrite_followup_question(question: str, history: list,
                               last_df, model_name: str) -> str:
     """
@@ -1316,37 +1407,52 @@ def answer(question: str, history: list, user: dict,
 
     scope_note = ""
     if needs_fresh or is_followup:
-        # A follow-up needs fresh, intent-appropriate retrieval (rather than the
-        # flat HR+reward enrichment below) whenever:
-        #   (a) the classified intent genuinely changed from last turn's topic, or
-        #   (b) the intent is one of the specialized-table intents, which can
-        #       never be answered from HR+reward fields even on a repeat visit
-        #       (e.g. staying on "login" two turns in a row).
-        # cross_join is excluded from (a) — it's definitionally "tell me more
-        # about the same employees", so the flat enrichment is exactly right
-        # for it even though its "intent" differs from whatever came before.
         prev_intent = ctx.get("topic_intent")
-        topic_switched = (
-            prev_intent is not None and intent != prev_intent and intent != "cross_join"
-        )
-        needs_domain_switch = topic_switched or intent in _SPECIALIZED_DOMAIN_INTENTS
 
-        if needs_domain_switch:
-            try:
-                df, data_context, scope_note = _get_scoped_fresh_context(
-                    intent, scoped_countries, last_df, route_q
-                )
-                chart = build_chart(intent, df)
-            except Exception:
-                df, data_context = _get_followup_context(scoped_countries, last_df)
-                chart = None
+        # Try drilling into a specific category of the PREVIOUS aggregated
+        # result first (e.g. "who are the Below Expectations ones" after a
+        # PMGM distribution) — see _drill_into_prior_aggregate for why this
+        # needs separate handling from the general follow-up paths below.
+        _drill_df, _drill_ctx = (None, None)
+        if is_followup and prev_intent:
+            _drill_df, _drill_ctx = _drill_into_prior_aggregate(
+                prev_intent, route_q, last_df, scoped_countries
+            )
+
+        if _drill_df is not None:
+            df, data_context = _drill_df, _drill_ctx
+            chart = None  # drilled-down rows don't match any aggregate chart's expected shape
         else:
-            try:
-                df, data_context = _get_followup_context(scoped_countries, last_df)
-                chart = None
-            except Exception:
-                df, data_context = retrieve_data(intent, scoped_countries, route_q)
-                chart = build_chart(intent, df)
+            # A follow-up needs fresh, intent-appropriate retrieval (rather than the
+            # flat HR+reward enrichment below) whenever:
+            #   (a) the classified intent genuinely changed from last turn's topic, or
+            #   (b) the intent is one of the specialized-table intents, which can
+            #       never be answered from HR+reward fields even on a repeat visit
+            #       (e.g. staying on "login" two turns in a row).
+            # cross_join is excluded from (a) — it's definitionally "tell me more
+            # about the same employees", so the flat enrichment is exactly right
+            # for it even though its "intent" differs from whatever came before.
+            topic_switched = (
+                prev_intent is not None and intent != prev_intent and intent != "cross_join"
+            )
+            needs_domain_switch = topic_switched or intent in _SPECIALIZED_DOMAIN_INTENTS
+
+            if needs_domain_switch:
+                try:
+                    df, data_context, scope_note = _get_scoped_fresh_context(
+                        intent, scoped_countries, last_df, route_q
+                    )
+                    chart = build_chart(intent, df)
+                except Exception:
+                    df, data_context = _get_followup_context(scoped_countries, last_df)
+                    chart = None
+            else:
+                try:
+                    df, data_context = _get_followup_context(scoped_countries, last_df)
+                    chart = None
+                except Exception:
+                    df, data_context = retrieve_data(intent, scoped_countries, route_q)
+                    chart = build_chart(intent, df)
 
     elif intent == "free_form" and not use_vector:
         try:
