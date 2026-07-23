@@ -183,8 +183,12 @@ def retrieve_data(intent: str, countries: list, question: str):
         from semantic import get_threshold, normalise
         min_cycles = get_threshold("consecutive_miss_min", 3)
         df = underperformer_summary(countries, min_cycles=min_cycles)
-        fh = get_flash_home(countries)[["EmployeeID","Country","Project"]]
-        df = df.merge(fh, on="EmployeeID", how="left")
+        # underperformer_summary() already includes Country/Project/JobTitle/
+        # EmployeeGrade from Flash Home — re-merging them here caused a
+        # Country_x/Country_y collision (no clean "Country" column at all,
+        # which silently broke the chart's country-coloring below and any
+        # follow-up wanting to group by country). _add_names() safely adds
+        # only what's still missing (name, department, supervisor).
         df = _add_names(df, countries)
         return df, f"Employees with >={min_cycles} consecutive cycles below target, scope: {scope}.\n{df.to_string(index=False)}"
 
@@ -1101,31 +1105,70 @@ _DRILLABLE_AGGREGATES = {
 }
 
 
+# Small, fixed lookup — country names/codes users actually type. Country is a
+# closed set here (unlike PMGM ratings, tenure bands etc. which come straight
+# out of the prior aggregate), so a static map is fine.
+_COUNTRY_NAME_MAP = {
+    "singapore": "SG", "sg": "SG",
+    "malaysia": "MY", "my": "MY",
+    "philippines": "PH", "ph": "PH",
+    "thailand": "TH", "th": "TH",
+    "indonesia": "ID", "id": "ID",
+}
+
+
+def _extract_country_mention(question: str) -> str:
+    q_lower = question.lower()
+    for name, code in _COUNTRY_NAME_MAP.items():
+        if re.search(rf"\b{name}\b", q_lower):
+            return code
+    return None
+
+
 def _drill_into_prior_aggregate(prev_intent: str, question: str, last_df, countries: list) -> tuple:
     """
-    Handles a follow-up that asks to list the individuals behind one slice of
-    the PREVIOUS turn's aggregated result. Aggregated results (PMGM
-    distribution, headcount, tenure/country/project breakdowns) never carry
-    per-employee rows — the groupby collapses them — so there's nothing for
-    the normal last_df-narrowing logic to work with, and it was falling
-    through to an unrelated free_form sample.
+    Handles a question that asks to list the individuals behind one slice of
+    an aggregated result — either a genuine follow-up ("who are the Below
+    Expectations ones", with last_df = the previous turn's aggregate), or a
+    fresh, explicitly-filtered question with no conversational continuity at
+    all ("Flash Home filtered by PMGMRating = 'Exceptional' and Country =
+    'SG'", where last_df is None). Aggregated results (PMGM distribution,
+    headcount, tenure/country/project breakdowns) never carry per-employee
+    rows — the groupby collapses them — so there's nothing for the normal
+    last_df-narrowing logic to work with.
 
-    Instead: read the actual category VALUES out of the previous aggregated
-    df (e.g. 'Below Expectations', '5–10 years', 'Singapore') rather than
-    guessing from a hardcoded phrase list, check whether the follow-up
-    mentions one of them, and if so re-fetch the underlying per-employee
-    table filtered to exactly that value — so it can never disagree with the
-    categorisation the user is looking at on screen.
+    Reads the actual category VALUES out of an aggregated df (last_df if
+    there is one and it fits; otherwise a fresh aggregate fetched just to
+    learn the valid values) rather than guessing from a hardcoded phrase
+    list, checks whether the question mentions one of them, and if so
+    re-fetches the underlying per-employee table filtered to exactly that
+    value — plus a country filter too, if the question names one. This means
+    it can never disagree with the categorisation the user is looking at,
+    and works the same way whether or not this is a "follow-up" in the
+    conversational sense.
 
     Returns (df, data_context) or (None, None) if this isn't that kind of
-    follow-up (caller falls through to normal follow-up handling).
+    question (caller falls through to normal handling).
     """
     group_col = _DRILLABLE_AGGREGATES.get(prev_intent)
-    if not group_col or last_df is None or group_col not in getattr(last_df, "columns", []):
+    if not group_col:
+        return None, None
+
+    candidates_source = last_df
+    if candidates_source is None or group_col not in getattr(candidates_source, "columns", []):
+        # No usable prior aggregate (e.g. this isn't a follow-up at all) —
+        # fetch one fresh purely to learn the valid category values for this
+        # intent. Country scope doesn't matter here since we only read the
+        # column's distinct values, not the counts.
+        try:
+            candidates_source, _ = retrieve_data(prev_intent, countries, question)
+        except Exception:
+            return None, None
+    if candidates_source is None or group_col not in getattr(candidates_source, "columns", []):
         return None, None
 
     q_lower = re.sub(r"[–—]", "-", question.lower())
-    candidates = [str(v) for v in last_df[group_col].dropna().unique().tolist()]
+    candidates = [str(v) for v in candidates_source[group_col].dropna().unique().tolist()]
 
     def _lenient_pattern(value: str) -> str:
         # Tolerate minor phrasing drift like singular/plural ("expectation" vs
@@ -1159,6 +1202,16 @@ def _drill_into_prior_aggregate(prev_intent: str, question: str, last_df, countr
     else:
         return None, None
 
+    # A question can name BOTH a category value and a specific country at
+    # once ("PMGMRating = 'Exceptional' and Country = 'SG'") — apply that
+    # too, on top of the category filter, rather than only ever filtering on
+    # one dimension.
+    filter_desc = f"{group_col} = '{matched_value}'"
+    mentioned_country = _extract_country_mention(question)
+    if mentioned_country and "Country" in matched.columns and group_col != "Country":
+        matched = matched[matched["Country"] == mentioned_country]
+        filter_desc += f", Country = '{mentioned_country}'"
+
     if matched.empty:
         return None, None
 
@@ -1167,11 +1220,75 @@ def _drill_into_prior_aggregate(prev_intent: str, question: str, last_df, countr
         "EmployeeStatus", "JobTitle", "EmployeeGrade", "PMGMRating",
     ] if c in matched.columns]
     desc = (
-        f"Employees where {group_col} = '{matched_value}' ({len(matched)} found, "
-        f"drilled down from your previous {prev_intent.replace('_',' ')} result).\n"
+        f"Employees where {filter_desc} ({len(matched)} found, "
+        f"drilled down from a {prev_intent.replace('_',' ')} view).\n"
         f"{matched[show].to_string(index=False)}"
     )
     return matched, desc
+
+
+_BREAKDOWN_DIMENSION_MAP = {
+    "country": "Country", "countries": "Country",
+    "status": "EmployeeStatus",
+    "project": "Project",
+    "scheme": "Scheme",
+    "tenure": "TenureBand",   # derived from JoinDate, see below
+}
+
+
+def _local_breakdown_of_prior_result(question: str, last_df) -> tuple:
+    """
+    Handles a follow-up asking to break the PREVIOUS result down by a
+    dimension — "break that down by country", "which country has the most",
+    "how many in each status" — when the previous result is already a
+    per-employee list (has EmployeeID) that has that column available.
+
+    This is deliberately tried BEFORE the topic-switch/aggregate-drill logic:
+    switching to a different intent's fresh, company-wide aggregate (e.g.
+    country_compare's average payout by country) would silently lose the "of
+    these specific flagged employees" framing — "which country has the most"
+    after an underperformance list means "most underperformers", not
+    "highest average payout company-wide". Grouping the prior result locally
+    keeps that framing intact.
+
+    Returns (df, data_context) or (None, None) if this doesn't apply (caller
+    falls through to normal handling).
+    """
+    if last_df is None or "EmployeeID" not in getattr(last_df, "columns", []):
+        return None, None
+
+    q_lower = question.lower()
+    m = re.search(
+        r"\b(break\w*\s*down|breakdown|split|group|segment)\b[^.?!]{0,25}\bby\b\s+(\w+)"
+        r"|\bby\s+(\w+)\b"
+        r"|\bhow many\b[^.?!]{0,15}\beach\s+(\w+)"
+        r"|\bwhich\s+(\w+)\s+has\s+the\s+most\b",
+        q_lower
+    )
+    if not m:
+        return None, None
+    dim_word = next((g for g in m.groups() if g), None)
+    column = _BREAKDOWN_DIMENSION_MAP.get(dim_word)
+    if not column:
+        return None, None
+
+    working = last_df.copy()
+    if column == "TenureBand":
+        if "JoinDate" not in working.columns:
+            return None, None
+        working["TenureYears"] = ((pd.Timestamp.today() - pd.to_datetime(working["JoinDate"])).dt.days / 365.25).round(1)
+        working["TenureBand"] = working["TenureYears"].apply(_tenure_band)
+    if column not in working.columns:
+        return None, None
+
+    counts = (working.groupby(column).size().reset_index(name="Count")
+              .sort_values("Count", ascending=False))
+    desc = (
+        f"Breakdown of your previous {len(working)}-record result by {column} "
+        f"(counts of THOSE specific records only — not a separate, company-wide comparison):\n"
+        f"{counts.to_string(index=False)}"
+    )
+    return counts, desc
 
 
 def rewrite_followup_question(question: str, history: list,
@@ -1430,17 +1547,29 @@ def answer(question: str, history: list, user: dict,
     if needs_fresh or is_followup:
         prev_intent = ctx.get("topic_intent")
 
+        # Try local breakdown of the PREVIOUS result first ("which country has
+        # the most" after underperformance should count those employees by
+        # country, not switch to an unrelated company-wide aggregate) — see
+        # _local_breakdown_of_prior_result for why this needs to come before
+        # the aggregate drill-down and topic-switch logic below.
+        _bd_df, _bd_ctx = (None, None)
+        if is_followup:
+            _bd_df, _bd_ctx = _local_breakdown_of_prior_result(route_q, last_df)
+
         # Try drilling into a specific category of the PREVIOUS aggregated
         # result first (e.g. "who are the Below Expectations ones" after a
         # PMGM distribution) — see _drill_into_prior_aggregate for why this
         # needs separate handling from the general follow-up paths below.
         _drill_df, _drill_ctx = (None, None)
-        if is_followup and prev_intent:
+        if _bd_df is None and is_followup and prev_intent:
             _drill_df, _drill_ctx = _drill_into_prior_aggregate(
                 prev_intent, route_q, last_df, scoped_countries
             )
 
-        if _drill_df is not None:
+        if _bd_df is not None:
+            df, data_context = _bd_df, _bd_ctx
+            chart = None
+        elif _drill_df is not None:
             df, data_context = _drill_df, _drill_ctx
             chart = None  # drilled-down rows don't match any aggregate chart's expected shape
         else:
@@ -1508,8 +1637,17 @@ def answer(question: str, history: list, user: dict,
         data_context = f"[Semantic retrieval — top relevant records]\n{data_context}"
 
     else:
-        df, data_context = retrieve_data(intent, scoped_countries, route_q)
-        chart = build_chart(intent, df)
+        _fresh_drill_df, _fresh_drill_ctx = (None, None)
+        if intent in _DRILLABLE_AGGREGATES:
+            _fresh_drill_df, _fresh_drill_ctx = _drill_into_prior_aggregate(
+                intent, route_q, None, scoped_countries
+            )
+        if _fresh_drill_df is not None:
+            df, data_context = _fresh_drill_df, _fresh_drill_ctx
+            chart = None
+        else:
+            df, data_context = retrieve_data(intent, scoped_countries, route_q)
+            chart = build_chart(intent, df)
 
     # Apply scheme / status filter — only for intents where explicit filtering is appropriate.
     # Never filter by status on workforce-wide analysis intents (anomaly, attainment, etc.)
