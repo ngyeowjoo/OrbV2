@@ -15,6 +15,30 @@ import streamlit as st
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 ROUTER_MODEL     = "deepseek-v4-flash"
 
+# Used only by _regex_fallback (DeepSeek unavailable) to pull an explicit
+# country mention out of the question text — the regex fallback previously
+# never populated filters["country"] from the question at all, only from
+# inherited/pinned context, so an explicit "...in Malaysia" was silently
+# ignored and the query ran region-wide.
+# NOT bare "my"/"id" as codes — they collide with the possessive pronoun
+# ("show my team") and "employee id" respectively, causing false-positive
+# country scoping. Full country names still match; sg/ph/th are safe since
+# they aren't common English words.
+_COUNTRY_NAME_MAP = {
+    "singapore": "SG", "sg": "SG",
+    "malaysia": "MY",
+    "philippines": "PH", "ph": "PH",
+    "thailand": "TH", "th": "TH",
+    "indonesia": "ID",
+}
+
+
+def _extract_country_mention(q_lower: str) -> str:
+    for name, code in _COUNTRY_NAME_MAP.items():
+        if re.search(rf"\b{name}\b", q_lower):
+            return code
+    return None
+
 KNOWN_INTENTS = [
     "attainment",       # % hitting max payout, payout achievement
     "underperformance", # missed targets, consecutive misses
@@ -197,6 +221,13 @@ def _regex_fallback(question: str, ctx: dict = None) -> dict:
         for k, v in ctx["active_filters"].items():
             if v is not None and k in filters:
                 filters[k] = v
+
+    # An explicit country mention in THIS question overrides whatever was
+    # inherited above — e.g. "who resigned in Malaysia?" should scope to MY
+    # even if the prior turn was scoped to something else (or nothing).
+    mentioned_country = _extract_country_mention(q)
+    if mentioned_country:
+        filters["country"] = mentioned_country
 
     return {
         "intent":             intent,
