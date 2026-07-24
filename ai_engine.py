@@ -1110,10 +1110,11 @@ _DRILLABLE_AGGREGATES = {
 # out of the prior aggregate), so a static map is fine.
 _COUNTRY_NAME_MAP = {
     "singapore": "SG", "sg": "SG",
-    "malaysia": "MY", "my": "MY",
+    "malaysia": "MY",   # NOT bare "my" — collides with the possessive pronoun
+                        # ("show my team") and would falsely scope to Malaysia
     "philippines": "PH", "ph": "PH",
     "thailand": "TH", "th": "TH",
-    "indonesia": "ID", "id": "ID",
+    "indonesia": "ID",  # NOT bare "id" — collides with "employee id" etc.
 }
 
 
@@ -1585,11 +1586,19 @@ def answer(question: str, history: list, user: dict,
             #       same question again would otherwise fall through to the flat
             #       per-employee join instead of a real re-aggregation. This bit
             #       the exact case (b) doesn't catch: same intent, repeat visit.
-            # cross_join is excluded from (a) — it's definitionally "tell me more
-            # about the same employees", so the flat enrichment is exactly right
-            # for it even though its "intent" differs from whatever came before.
+            # cross_join AND free_form are excluded from (a):
+            #   - cross_join is definitionally "tell me more about the same
+            #     employees", so the flat enrichment is exactly right for it.
+            #   - free_form's own retrieve_data() handler always returns
+            #     df=None (it's a lightweight scope summary, not a filterable
+            #     table) — routing it through the fresh/domain-switch path
+            #     would immediately short-circuit on that None before ever
+            #     attempting to narrow to the prior entities, silently
+            #     dropping the link to whoever was being discussed. The flat
+            #     enrichment path narrows to them correctly instead.
             topic_switched = (
-                prev_intent is not None and intent != prev_intent and intent != "cross_join"
+                prev_intent is not None and intent != prev_intent
+                and intent not in ("cross_join", "free_form")
             )
             needs_domain_switch = (
                 topic_switched
