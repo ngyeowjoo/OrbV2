@@ -33,11 +33,30 @@ _COUNTRY_NAME_MAP = {
 }
 
 
-def _extract_country_mention(q_lower: str) -> str:
+def _extract_all_country_mentions(q_lower: str) -> list:
+    """All distinct country codes mentioned, in the order they first appear
+    in the TEXT — not dict definition order (see ai_engine.py's copy of this
+    for the full rationale; kept duplicated to avoid a circular import)."""
+    hits = []
     for name, code in _COUNTRY_NAME_MAP.items():
-        if re.search(rf"\b{name}\b", q_lower):
-            return code
-    return None
+        m = re.search(rf"\b{name}\b", q_lower)
+        if m:
+            hits.append((m.start(), code))
+    hits.sort(key=lambda x: x[0])
+    seen, ordered = set(), []
+    for _, code in hits:
+        if code not in seen:
+            seen.add(code)
+            ordered.append(code)
+    return ordered
+
+
+def _extract_country_mention(q_lower: str) -> str:
+    """Returns the mentioned country only when exactly ONE distinct country
+    is named — if several are named ("Thailand and Indonesia"), returns None
+    rather than arbitrarily narrowing to just one of them."""
+    codes = _extract_all_country_mentions(q_lower)
+    return codes[0] if len(codes) == 1 else None
 
 KNOWN_INTENTS = [
     "attainment",       # % hitting max payout, payout achievement
@@ -203,7 +222,8 @@ def _regex_fallback(question: str, ctx: dict = None) -> dict:
         r"\b(they|those|these|them|same|among|of those|of them|their|"
         r"that employee|those employees|the above|that group|those people|"
         r"break that|break it|drill down|zoom in|and the|what about|"
-        r"when did|what is their|what was their|who is their)\b"
+        r"when did|what is their|what was their|who is their|"
+        r"(who|which)\s+(are|is)\s+the\s+(ones?|those))\b"
     )
     is_followup = bool(re.search(followup_patterns, q))
 
@@ -221,6 +241,17 @@ def _regex_fallback(question: str, ctx: dict = None) -> dict:
         for k, v in ctx["active_filters"].items():
             if v is not None and k in filters:
                 filters[k] = v
+
+    # Explicit request to drop an established country filter ("no country
+    # filter", "all countries", "company-wide") — checked before the mention
+    # override below, so a stale inherited country can't get stuck forever
+    # once set. If the SAME question also names a specific country ("no
+    # filter, just show Singapore" — unusual but possible), the mention
+    # check below still runs after this and will correctly set it again.
+    if re.search(r"\ball countries\b|\bno (country )?filter\b|\bcompany.?wide\b|"
+                 r"\bglobal(ly)?\b|\bevery country\b|\bacross all countries\b",
+                 q):
+        filters["country"] = None
 
     # An explicit country mention in THIS question overrides whatever was
     # inherited above — e.g. "who resigned in Malaysia?" should scope to MY
