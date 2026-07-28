@@ -21,6 +21,7 @@ Usage
   from conversation_state import get_ctx, update_ctx, reset_ctx, ctx_for_router, ctx_for_ai
 """
 
+import copy
 import streamlit as st
 
 _SS_KEY = "conv_ctx"
@@ -46,7 +47,7 @@ _DEFAULTS = {
 
 def _init():
     if _SS_KEY not in st.session_state:
-        st.session_state[_SS_KEY] = dict(_DEFAULTS)
+        st.session_state[_SS_KEY] = copy.deepcopy(_DEFAULTS)
 
 
 def get_ctx() -> dict:
@@ -108,7 +109,7 @@ def clear_clarification():
 def reset_ctx():
     """Call when a new chat starts."""
     _init()
-    st.session_state[_SS_KEY] = dict(_DEFAULTS)
+    st.session_state[_SS_KEY] = copy.deepcopy(_DEFAULTS)
 
 
 def bump_topic(new_intent: str, topic_summary: str, router_filters: dict):
