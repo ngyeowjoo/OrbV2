@@ -109,7 +109,7 @@ INTENT_PATTERNS = {
     "underperformance": r"(miss|under.?perform|below target|not hit|consistent.*miss|consistent.*below)",
     "attainment":       r"(\battainment\b|hit max|reach max|attain max|max payout|hit.*maximum|% hit|pct.*hit|what %.*payout|payout.*%|% of.*payout|hit full|full payout)",
     "employee_list":    r"(show.*name|list.*name|employee.*name|name.*employee|all employee|employee list|staff list|roster|directory)",
-    "headcount":        r"(headcount|how many employee|count.*employee|employee.*count|workforce size|number of employee|how many.*(in|per|by) (each )?countr|breakdown by (country|status)|count by country)",
+    "headcount":        r"(headcount|how many employee|count.*employee|employee.*\bcount(?!ry)\b|workforce size|number of employee|how many.*(in|per|by) (each )?countr|breakdown by (country|status)|count by country)",
     "attrition":        r"(attrition|resign|turnover|leavers?)",
     "pmgm":             r"(pmgm|performance rating|rating distribution|appraisal)",
     "cycle_summary":    r"(summary|overview|this cycle|cycle summary|brief me)",
@@ -1046,6 +1046,45 @@ _SPECIALIZED_DOMAIN_INTENTS = {
 }
 
 
+def _aggregate_over_prior_employees(intent: str, group_col: str, countries: list, prior_ids: set) -> tuple:
+    """
+    Recomputes an aggregate intent's grouping (PMGM rating counts, headcount
+    by status, etc) scoped ONLY to prior_ids, instead of the full
+    company/scope. Used by _get_scoped_fresh_context when a follow-up
+    switches from a per-employee intent (ranking, underperformance, ...) to
+    an aggregate intent (pmgm, headcount, ...) and asks about "them" — the
+    aggregate's own retrieve_data() result has no EmployeeID column at all to
+    narrow on directly, so without this, the narrowing was silently skipped
+    and the full company-wide aggregate returned with no indication anything
+    had gone wrong.
+
+    Returns (df, data_context) or (None, None) if this can't be computed
+    (e.g. none of the prior employees remain in the current scope).
+    """
+    from data import get_flash_home
+    fh = get_flash_home(countries)
+    working = fh[fh["EmployeeID"].isin(prior_ids)].copy()
+    if working.empty:
+        return None, None
+
+    if group_col == "TenureBand":
+        if "JoinDate" not in working.columns:
+            return None, None
+        working["TenureYears"] = ((pd.Timestamp.today() - pd.to_datetime(working["JoinDate"])).dt.days / 365.25).round(1)
+        working["TenureBand"] = working["TenureYears"].apply(_tenure_band)
+    if group_col not in working.columns:
+        return None, None
+
+    counts = (working.groupby(group_col).size().reset_index(name="Count")
+              .sort_values("Count", ascending=False))
+    desc = (
+        f"{group_col} breakdown of the {len(working)} employee(s) from your previous "
+        f"question/result (NOT a company-wide comparison):\n"
+        f"{counts.to_string(index=False)}"
+    )
+    return counts, desc
+
+
 def _get_scoped_fresh_context(intent: str, countries: list, last_df, question: str) -> tuple:
     """
     Fresh, intent-appropriate retrieval for a follow-up that switched to a
@@ -1056,9 +1095,11 @@ def _get_scoped_fresh_context(intent: str, countries: list, last_df, question: s
     result and says so explicitly, in both the data context (for the model)
     and the returned scope_note (for the UI to optionally surface).
 
-    Returns (df, data_context, scope_note). scope_note is "" when nothing
-    unusual happened (no prior employees to narrow to, or narrowing worked
-    with no need to explain it beyond the data context itself).
+    Returns (df, data_context, scope_note). scope_note is "" only when there
+    was genuinely nothing to narrow to (no usable prior result) — any other
+    outcome (narrowed successfully, narrowed to zero, or fell back to full
+    scope because narrowing wasn't possible) always sets a scope_note, so
+    the caller never silently returns the wrong population with no signal.
     """
     df, data_context = retrieve_data(intent, countries, question)
 
@@ -1066,11 +1107,34 @@ def _get_scoped_fresh_context(intent: str, countries: list, last_df, question: s
     if last_df is not None and "EmployeeID" in last_df.columns and not last_df.empty:
         prior_ids = set(last_df["EmployeeID"].dropna().tolist())
 
-    if not prior_ids or df is None or df.empty or "EmployeeID" not in df.columns:
+    if not prior_ids:
+        return df, data_context, ""
+
+    label = intent.replace("_", " ")
+
+    # Aggregate-shaped intents (pmgm, headcount, country/tenure/project_compare)
+    # never carry an EmployeeID column to narrow on directly — that's a
+    # property of the aggregation, not a sign there's nothing to narrow to.
+    # Recompute the same grouping scoped to just the prior employees instead.
+    if intent in _DRILLABLE_AGGREGATES and (df is None or "EmployeeID" not in getattr(df, "columns", [])):
+        group_col = _DRILLABLE_AGGREGATES[intent]
+        scoped_df, scoped_ctx = _aggregate_over_prior_employees(intent, group_col, countries, prior_ids)
+        if scoped_df is not None:
+            scope_note = (
+                f"Switched to {label} data — computed only over the {len(prior_ids)} "
+                f"employee(s) from your previous question, not the full scope."
+            )
+            return scoped_df, scoped_ctx + f"\n\nNOTE TO AI: {scope_note}", scope_note
+        scope_note = (
+            f"Switched to {label} data — couldn't narrow to your previous employees "
+            f"(none remain in the current scope), so this is the full scope instead."
+        )
+        return df, data_context + f"\n\nNOTE TO AI: {scope_note}", scope_note
+
+    if df is None or df.empty or "EmployeeID" not in df.columns:
         return df, data_context, ""
 
     narrowed = df[df["EmployeeID"].isin(prior_ids)]
-    label = intent.replace("_", " ")
 
     if narrowed.empty:
         scope_note = (
@@ -1118,12 +1182,35 @@ _COUNTRY_NAME_MAP = {
 }
 
 
-def _extract_country_mention(question: str) -> str:
+def _extract_all_country_mentions(question: str) -> list:
+    """All distinct country codes mentioned, in the order they first appear
+    in the TEXT — not dict definition order (a plain 'first match in a dict
+    loop' approach means 'Thailand and Indonesia' and 'Indonesia and
+    Thailand' would resolve to whichever happens to iterate first in
+    _COUNTRY_NAME_MAP, regardless of what the sentence actually says)."""
     q_lower = question.lower()
+    hits = []
     for name, code in _COUNTRY_NAME_MAP.items():
-        if re.search(rf"\b{name}\b", q_lower):
-            return code
-    return None
+        m = re.search(rf"\b{name}\b", q_lower)
+        if m:
+            hits.append((m.start(), code))
+    hits.sort(key=lambda x: x[0])
+    seen, ordered = set(), []
+    for _, code in hits:
+        if code not in seen:
+            seen.add(code)
+            ordered.append(code)
+    return ordered
+
+
+def _extract_country_mention(question: str) -> str:
+    """Single-country convenience wrapper. Returns the mentioned country only
+    when exactly ONE distinct country is named. If the question names
+    several ("compare Thailand and Indonesia"), returns None rather than
+    arbitrarily picking one — narrowing to a single country would silently
+    drop the other side of the comparison instead of leaving scope alone."""
+    codes = _extract_all_country_mentions(question)
+    return codes[0] if len(codes) == 1 else None
 
 
 def _drill_into_prior_aggregate(prev_intent: str, question: str, last_df, countries: list) -> tuple:
