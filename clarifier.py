@@ -56,7 +56,9 @@ def _is_short(q: str) -> bool:
 
 def _mentions_country(q: str) -> bool:
     return bool(re.search(
-        r"\b(sg|my|ph|th|id|singapore|malaysia|philippines|thailand|indonesia)\b",
+        r"\b(sg|my|ph|th|id|singapore|malaysia|philippines|thailand|indonesia|"
+        r"all countries|every country|across all countries|"
+        r"company.?wide|global(ly)?)\b",
         q, re.IGNORECASE
     ))
 
