@@ -117,8 +117,15 @@ def needs_clarification(
     if routing.get("is_followup"):
         return False, None
 
-    # Never clarify if the question already has enough specificity
+    # Never clarify if the question already has enough specificity — either
+    # because THIS turn names a country/scheme, or because one was already
+    # established earlier in the conversation (pinned scope, or inherited
+    # from a prior turn's filters). Without checking the latter, scope set
+    # once at the start of a chat was invisible here on any later turn that
+    # wasn't itself flagged as a follow-up, so Rule 4 kept re-asking.
     if routing.get("filters", {}).get("country") or routing.get("filters", {}).get("scheme"):
+        return False, None
+    if ctx.get("pinned_country") or (ctx.get("active_filters") or {}).get("country"):
         return False, None
 
     # ── RULE 1: Vague "show me everything" on free_form ─────────────────────
