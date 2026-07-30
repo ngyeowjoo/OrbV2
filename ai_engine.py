@@ -99,7 +99,7 @@ INTENT_PATTERNS = {
     # check). Plain "leaver"/"resign" questions belong to attrition, so this
     # requires the payout angle rather than matching "leaver" alone — otherwise
     # it swallows attrition questions before the attrition pattern is reached.
-    "cross_check":      r"((non.?active|inactive|left|leaver|exit).{0,25}(payout|paid|compensat)|(payout|paid|compensat).{0,25}(non.?active|inactive|left|leaver|exit))",
+    "cross_check":      r"((non.?active|inactive|left|leaver|exit).{0,50}(payout|paid|compensat)|(payout|paid|compensat).{0,50}(non.?active|inactive|left|leaver|exit))",
     "country_compare":  r"(compare.*countr(y|ies)|countr(y|ies).*compare|vs.*countr(y|ies)|countr(y|ies).*vs|\bvs\b.*[A-Z]{2}|compare.*(sg|my|ph|th|id))",
     "ranking":          r"(top \d+|bottom \d+|highest pay|lowest pay|best perform|worst perform|above.?average|below.?average|hit.*above|hit.*below|rank(ing)?|most paid|least paid|who earn|top perform|highest earning|lowest earning)",
     "anomaly":          r"(anomaly|anomalies|mismatch|unusual|discrepanc|doesn'?t match|high.*rating.*low|low.*rating.*high|pmgm.*payout|payout.*pmgm)",
@@ -940,11 +940,34 @@ def call_model(messages, system, model_name):
         return _call_anthropic(messages, system, cfg["model_id"])
     return _call_deepseek(messages, system, cfg["model_id"])
 
-def _get_followup_context(countries: list, last_df) -> tuple:
+def _find_named_employee(question: str, fh) -> "pd.DataFrame | None":
+    """
+    If the question mentions a specific employee's full name (e.g. "check
+    for Jian Patel"), search the FULL roster (fh, already scoped to the
+    user's permitted countries) for a match. Returns the matching row(s), or
+    None if no name is mentioned / no match found.
+    """
+    if fh is None or "EmployeeName" not in fh.columns or not question:
+        return None
+    q_lower = question.lower()
+    names = fh["EmployeeName"].dropna().unique().tolist()
+    matches = [n for n in names if len(n) > 3 and n.lower() in q_lower]
+    if not matches:
+        return None
+    return fh[fh["EmployeeName"].isin(matches)]
+
+
+def _get_followup_context(countries: list, last_df, question: str = "") -> tuple:
     """
     Idea 1: last_df-first follow-up context.
 
     Priority order:
+    0. If the question names a SPECIFIC employee who isn't already covered
+       by last_df, search the full roster for them by name instead of
+       silently confining the answer to last_df's (possibly small, unrelated)
+       sample — e.g. a follow-up naming someone after a 50-row cycle-summary
+       sample shouldn't report "not found" just because they weren't part of
+       that unrelated sample.
     1. If last_df has EmployeeID — enrich it with ALL HR + reward fields and use it.
        This keeps the AI focused on exactly the employees from the prior result.
     2. Fallback: fetch latest cycle company-wide (capped at 150 rows).
@@ -967,6 +990,28 @@ def _get_followup_context(countries: list, last_df) -> tuple:
         "EmployeeID","Scheme","SchemeMaxPayout","TotalCyclePayout",
         "TierAchieved","QualifierFailed","ProrFactor","PayoutEarned",
     ] if c in fr.columns]
+
+    # ── PATH 0: A specific named employee was mentioned and isn't already
+    # covered by last_df — search the full roster for them instead of
+    # narrowing to (or reporting "not found" from) an unrelated sample.
+    named = _find_named_employee(question, fh)
+    if named is not None and not named.empty:
+        already_covered = (
+            last_df is not None and "EmployeeID" in getattr(last_df, "columns", [])
+            and set(named["EmployeeID"]).issubset(set(last_df["EmployeeID"].dropna()))
+        )
+        if not already_covered:
+            reward_extra = [c for c in reward_cols if c != "EmployeeID"]
+            context_df = named.merge(
+                fr[fr["Cycle"] == latest].drop_duplicates("EmployeeID")[["EmployeeID"] + reward_extra],
+                on="EmployeeID", how="left"
+            )
+            desc = (
+                f"NAMED EMPLOYEE LOOKUP — searched the full roster (not just the previous "
+                f"result) because this question named a specific person.\n"
+                f"{context_df.to_string(index=False)}"
+            )
+            return context_df, desc
 
     # ── PATH 1: Enrich last_df with any missing HR and reward fields ───────────
     if last_df is not None and "EmployeeID" in last_df.columns and not last_df.empty:
@@ -1700,11 +1745,11 @@ def answer(question: str, history: list, user: dict,
                     )
                     chart = build_chart(intent, df)
                 except Exception:
-                    df, data_context = _get_followup_context(scoped_countries, last_df)
+                    df, data_context = _get_followup_context(scoped_countries, last_df, route_q)
                     chart = None
             else:
                 try:
-                    df, data_context = _get_followup_context(scoped_countries, last_df)
+                    df, data_context = _get_followup_context(scoped_countries, last_df, route_q)
                     chart = None
                 except Exception:
                     df, data_context = retrieve_data(intent, scoped_countries, route_q)
